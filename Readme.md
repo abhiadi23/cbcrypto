@@ -1,6 +1,6 @@
 # cbcrypto
 
-Fast MTProto crypto for **wzgram** — a drop-in replacement for `warpcrypto`
+Fast MTProto crypto for **cbgram** — a drop-in replacement for `warpcrypto`
 (same function names, argument types, return values and error messages), written in Rust.
 
 | function | what it is |
@@ -12,7 +12,7 @@ Fast MTProto crypto for **wzgram** — a drop-in replacement for `warpcrypto`
 | `unpack_message` | fused: IGE decrypt **interleaved with** SHA-256 of the plaintext, then all MTProto checks |
 | `backend()` | tells you which CPU acceleration this build really uses |
 
-The GIL is released for anything ≥ 8 KiB, so wzgram's crypto thread pool runs in parallel.
+The GIL is released for anything ≥ 8 KiB, so cbgram's crypto thread pool runs in parallel.
 
 ## Install
 
@@ -26,8 +26,8 @@ The GIL is released for anything ≥ 8 KiB, so wzgram's crypto thread pool runs 
 python -c "import cbcrypto; print(cbcrypto.backend())"
 ```
 
-wzgram picks it up automatically (`WZGRAM_CRYPTO=warpcrypto` forces the old backend).
-If cbcrypto is missing, fails to import, or fails its self-test, wzgram silently keeps using warpcrypto.
+cbgram picks it up automatically (`CBGRAM_CRYPTO=warpcrypto` forces the old backend).
+If cbcrypto is missing, fails to import, or fails its self-test, cbgram silently keeps using warpcrypto.
 
 ## Verify before you trust it
 
