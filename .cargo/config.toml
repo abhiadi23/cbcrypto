@@ -1,0 +1,10 @@
+# ARM64 hardware AES (needed by the `aes` crate 0.8 on aarch64). Safe: the crate
+# still detects the CPU at runtime and falls back to software if it is missing.
+[target.aarch64-linux-android]
+rustflags = ["--cfg", "aes_armv8"]
+
+[target.aarch64-unknown-linux-gnu]
+rustflags = ["--cfg", "aes_armv8"]
+
+[target.aarch64-apple-darwin]
+rustflags = ["--cfg", "aes_armv8"]
