@@ -5,7 +5,7 @@ build-backend = "maturin"
 [project]
 name = "cbcrypto"
 version = "0.2.0"
-description = "Fast MTProto crypto for wzgram (drop-in for warpcrypto)"
+description = "Fast MTProto crypto for cbgram (drop-in for warpcrypto)"
 requires-python = ">=3.8"
 classifiers = ["Programming Language :: Rust"]
 
