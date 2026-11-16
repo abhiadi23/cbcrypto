@@ -1,8 +1,8 @@
 [package]
 name = "cbcrypto"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
-description = "Fast MTProto crypto for cbgram: drop-in replacement for warpcrypto (AES-256-IGE/CTR, KDF, fused pack/unpack)"
+description = "Rust core for cbgram: MTProto crypto (AES-256-IGE/CTR with AES-NI/VAES/AVX-512, KDF, fused pack/unpack) and the file download/upload engine"
 license = "LGPL-3.0-or-later"
 
 [lib]
@@ -14,6 +14,8 @@ pyo3 = { version = "0.22", features = ["extension-module", "abi3-py38"] }
 aes = "0.8"
 sha2 = { version = "0.10", features = ["compress"] }
 getrandom = "0.2"
+socket2 = "0.5"
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 
 [target.'cfg(target_arch = "aarch64")'.dependencies]
 # hardware SHA-2 on ARM64 (Termux/Android phones, Apple Silicon, Graviton)
