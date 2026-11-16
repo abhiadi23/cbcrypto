@@ -1,6 +1,5 @@
 //! cbcrypto - fast MTProto crypto for cbgram.
 //!
-//! Drop-in replacement for `warpcrypto` (same function names, argument types,
 //! return values and error messages) with a faster fused `unpack_message`.
 //!
 //! Why it can beat a plain "decrypt, then hash" implementation:
@@ -18,6 +17,8 @@ use pyo3::pybacked::PyBackedBytes;
 use pyo3::types::{PyByteArray, PyBytes};
 use sha2::digest::generic_array::{typenum::U64, GenericArray as ShaBlock};
 use sha2::{Digest, Sha256};
+
+mod engine;
 
 type Block = GenericArray<u8, aes::cipher::consts::U16>;
 
@@ -795,7 +796,7 @@ fn ige256_decrypt<'py>(
 /// `iv` is the counter of the *current* block (big-endian 128 bit, wrapping),
 /// `state` is how many bytes of that block were already used. The counter is
 /// incremented as soon as a block is fully consumed.
-fn ctr_apply(key: &[u8], data: &mut [u8], iv: &mut [u8; 16], state: &mut u8) {
+pub(crate) fn ctr_apply(key: &[u8], data: &mut [u8], iv: &mut [u8; 16], state: &mut u8) {
     #[cfg(target_arch = "x86_64")]
     if use_ni() {
         return ctr_apply_ni(key, data.as_ptr(), data.as_mut_ptr(), data.len(), iv, state);
@@ -1186,6 +1187,44 @@ fn validate_keys(session_id: &[u8], auth_key: &[u8], auth_key_id: &[u8]) -> PyRe
     Ok(())
 }
 
+/// Size of a packed message for a body of `body_len` bytes.
+pub(crate) fn packed_len(body_len: usize) -> usize {
+    let plain_len = 32 + body_len;
+    let pad = (16 - (plain_len + 12) % 16) % 16 + 12;
+    24 + plain_len + pad
+}
+
+/// Pure-Rust pack: fills `out` (exactly `packed_len(body.len())` bytes). False if the RNG failed.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn pack_fill(
+    out: &mut [u8],
+    msg_id: i64,
+    seq_no: i32,
+    body: &[u8],
+    salt: i64,
+    session_id: &[u8],
+    auth_key: &[u8],
+    auth_key_id: &[u8],
+) -> bool {
+    let plain_len = 32 + body.len();
+    let (head, plain) = out.split_at_mut(24);
+    head[..8].copy_from_slice(auth_key_id);
+    plain[..8].copy_from_slice(&salt.to_le_bytes());
+    plain[8..16].copy_from_slice(session_id);
+    plain[16..24].copy_from_slice(&msg_id.to_le_bytes());
+    plain[24..28].copy_from_slice(&seq_no.to_le_bytes());
+    plain[28..32].copy_from_slice(&(body.len() as u32).to_le_bytes());
+    plain[32..plain_len].copy_from_slice(body);
+    if fill_random(&mut plain[plain_len..]).is_err() {
+        return false;
+    }
+    let h = Sha256::new().chain_update(&auth_key[88..120]).chain_update(&*plain).finalize();
+    head[8..24].copy_from_slice(&h[8..24]);
+    let (k, iv) = kdf_raw(auth_key, &head[8..24], true);
+    ige_enc_inplace_any(&k, &iv, plain);
+    true
+}
+
 #[pyfunction]
 #[pyo3(signature = (msg_id, seq_no, body, salt, session_id, auth_key, auth_key_id))]
 fn pack_message<'py>(
@@ -1199,33 +1238,13 @@ fn pack_message<'py>(
     auth_key_id: PyBackedBytes,
 ) -> PyResult<Bound<'py, PyBytes>> {
     validate_keys(&session_id, &auth_key, &auth_key_id)?;
-
-    let plain_len = 32 + body.len();
-    let pad = (16 - (plain_len + 12) % 16) % 16 + 12;
-    let total_plain = plain_len + pad;
-    let out_len = 24 + total_plain;
-
+    let out_len = packed_len(body.len());
     let mut failed = false;
     let res = PyBytes::new_bound_with(py, out_len, |out| {
-        let (head, plain) = out.split_at_mut(24);
-        head[..8].copy_from_slice(&auth_key_id);
-        plain[..8].copy_from_slice(&salt.to_le_bytes());
-        plain[8..16].copy_from_slice(&session_id);
-        plain[16..24].copy_from_slice(&msg_id.to_le_bytes());
-        plain[24..28].copy_from_slice(&seq_no.to_le_bytes());
-        plain[28..32].copy_from_slice(&(body.len() as u32).to_le_bytes());
-        plain[32..plain_len].copy_from_slice(&body);
-        if fill_random(&mut plain[plain_len..]).is_err() {
-            failed = true;
-            return Ok(());
-        }
-
-        maybe_nogil(py, out_len, || {
-            let h = Sha256::new().chain_update(&auth_key[88..120]).chain_update(&*plain).finalize();
-            head[8..24].copy_from_slice(&h[8..24]);
-            let (k, iv) = kdf_raw(&auth_key, &head[8..24], true);
-            ige_enc_inplace_any(&k, &iv, plain);
+        let ok = maybe_nogil(py, out_len, || {
+            pack_fill(out, msg_id, seq_no, &body, salt, &session_id, &auth_key, &auth_key_id)
         });
+        failed = !ok;
         Ok(())
     })?;
     if failed {
@@ -1235,7 +1254,7 @@ fn pack_message<'py>(
 }
 
 /// Decrypt + verify. Returns the buffer `[auth_key slice (32) | plaintext]`.
-fn unpack_core(
+pub(crate) fn unpack_core(
     packed: &[u8],
     session_id: &[u8],
     auth_key: &[u8],
@@ -1316,6 +1335,32 @@ fn unpack_core(
     Ok(buf)
 }
 
+/// Checks done on the decrypted plaintext (same rules and order as warpcrypto):
+/// negative length -> length exceeds data -> length % 4 -> padding 12..=1024.
+pub(crate) fn parse_plain(p: &[u8]) -> Result<(i64, i32, u32), &'static str> {
+    if p.len() < 32 {
+        return Err("packed data too short");
+    }
+    let msg_id = i64::from_le_bytes(p[16..24].try_into().unwrap());
+    let seq_no = i32::from_le_bytes(p[24..28].try_into().unwrap());
+    let length_raw = i32::from_le_bytes(p[28..32].try_into().unwrap());
+    if length_raw < 0 {
+        return Err("negative body length");
+    }
+    let length = length_raw as u32;
+    if 32 + length as usize > p.len() {
+        return Err("body length exceeds decrypted data");
+    }
+    if length % 4 != 0 {
+        return Err("body length not divisible by 4");
+    }
+    let padding = p.len() - 32 - length as usize;
+    if !(12..=1024).contains(&padding) {
+        return Err("padding length out of range");
+    }
+    Ok((msg_id, seq_no, length))
+}
+
 #[pyfunction]
 #[pyo3(signature = (packed, session_id, auth_key, auth_key_id, incoming=true))]
 fn unpack_message<'py>(
@@ -1335,25 +1380,11 @@ fn unpack_message<'py>(
         Err(e) => return verr(e),
     };
     let p = &buf[32..]; // plaintext
-    let msg_id = i64::from_le_bytes(p[16..24].try_into().unwrap());
-    let seq_no = i32::from_le_bytes(p[24..28].try_into().unwrap());
-    let length_raw = i32::from_le_bytes(p[28..32].try_into().unwrap());
-    if length_raw < 0 {
-        return verr("negative body length");
-    }
-    let length = length_raw as u32;
+    let (msg_id, seq_no, length) = match parse_plain(p) {
+        Ok(v) => v,
+        Err(e) => return verr(e),
+    };
     let end = 32usize + length as usize;
-    if end > p.len() {
-        return verr("body length exceeds decrypted data");
-    }
-    if length % 4 != 0 {
-        return verr("body length not divisible by 4");
-    }
-    // MTProto 2.0 security check: 12 <= padding <= 1024
-    let padding = p.len() - 32 - length as usize;
-    if !(12..=1024).contains(&padding) {
-        return verr("padding length out of range");
-    }
     let body = PyBytes::new_bound(py, &p[32..end]);
     Ok((msg_id, seq_no, length, body, p.len() - 16))
 }
@@ -1414,6 +1445,7 @@ fn cbcrypto(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(backend, m)?)?;
     m.add_function(wrap_pyfunction!(_force_generic, m)?)?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
+    engine::register(m)?;
     let _ = PyOverflowError::new_err("");
     Ok(())
-                                                 }
+            }
