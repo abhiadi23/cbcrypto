@@ -4,8 +4,9 @@ build-backend = "maturin"
 
 [project]
 name = "cbcrypto"
-version = "0.2.0"
-description = "Fast MTProto crypto for cbgram (drop-in for warpcrypto)"
+version = "0.3.0"
+description = "Rust core for cbgram: MTProto crypto and the file download/upload engine"
+readme = "Readme.md"
 requires-python = ">=3.8"
 classifiers = ["Programming Language :: Rust"]
 
