@@ -19,6 +19,7 @@ use sha2::digest::generic_array::{typenum::U64, GenericArray as ShaBlock};
 use sha2::{Digest, Sha256};
 
 mod engine;
+mod tl;
 
 type Block = GenericArray<u8, aes::cipher::consts::U16>;
 
@@ -1446,6 +1447,7 @@ fn cbcrypto(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(_force_generic, m)?)?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     engine::register(m)?;
+    tl::register(m)?;
     let _ = PyOverflowError::new_err("");
     Ok(())
-            }
+                }
