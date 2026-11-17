@@ -57,3 +57,15 @@ From source (Linux, macOS, Termux): `./build.sh` (needs Rust >= 1.70).
 | aarch64 (Termux, Apple Silicon, Graviton) | RustCrypto + ARMv8 crypto (`--cfg aes_armv8`), `sha2` asm backend | compiles as portable code, **not run on ARM yet** |
 
 Never tested against real Telegram servers, only against the mock DC.
+
+## Native TL codec (0.4)
+
+`tl_init`, `tl_parse`, `tl_write` decode and encode whole TL object trees in one native pass
+(instead of one interpreter call per field), driven by a schema table that cbgram's compiler
+emits (`pyrogram/raw/tl_spec.py`). Containers, gzip and bare vectors are handled natively;
+anything outside the table (legacy constructors, subclasses overriding `write`) falls back to
+the generated Python classes. Measured 3-4x faster parsing and ~3x faster serialising on
+realistic payloads, 5x on small service messages.
+
+`factorize_pq(pq) -> (p, q)` is a Pollard-Brent factoriser for the handshake (GIL released);
+~15-120x faster than the pure-Python one.
