@@ -19,6 +19,7 @@ use sha2::digest::generic_array::{typenum::U64, GenericArray as ShaBlock};
 use sha2::{Digest, Sha256};
 
 mod engine;
+mod pacer;
 mod tl;
 
 type Block = GenericArray<u8, aes::cipher::consts::U16>;
@@ -228,6 +229,80 @@ mod ni {
                 }
             }
         }
+    }
+
+
+    /// AES-IGE decrypt `N` independent messages in lockstep. IGE decryption is one
+    /// serial dependency chain per message, so a single message keeps only one
+    /// AES round in flight while the core can sustain several; running N chains
+    /// side by side fills those idle slots. Every lane has its own key and IV and
+    /// decrypts exactly `n` blocks (the caller finishes longer lanes separately).
+    #[inline]
+    #[target_feature(enable = "aes,sse2")]
+    pub unsafe fn ige_dec_lanes<const N: usize>(
+        dk: [&Rk; N],
+        iv: [&[u8]; N],
+        src: [*const u8; N],
+        dst: [*mut u8; N],
+        n: usize,
+        mut hash: Option<(&mut [[u32; 8]; N], &mut [usize; N])>,
+    ) {
+        if n == 0 {
+            return;
+        }
+        let mut c_prev = [ld(iv[0].as_ptr()); N];
+        let mut c_cur = [ld(src[0]); N];
+        let mut s = [ld(src[0]); N];
+        for j in 0..N {
+            c_prev[j] = ld(iv[j].as_ptr());
+            let p0 = ld(iv[j].as_ptr().add(16));
+            c_cur[j] = ld(src[j]);
+            s[j] = _mm_xor_si128(_mm_xor_si128(c_cur[j], p0), dk[j][0]);
+        }
+        for i in 0..n {
+            let mut b = s;
+            for r in 1..14 {
+                for j in 0..N {
+                    b[j] = _mm_aesdec_si128(b[j], dk[j][r]);
+                }
+            }
+            for j in 0..N {
+                let c_next = if i + 1 < n { ld(src[j].add(16 * (i + 1))) } else { c_cur[j] };
+                st(dst[j].add(16 * i), _mm_aesdeclast_si128(b[j], _mm_xor_si128(dk[j][14], c_prev[j])));
+                s[j] = _mm_aesdeclast_si128(
+                    b[j],
+                    _mm_xor_si128(dk[j][14], _mm_xor_si128(_mm_xor_si128(c_next, c_prev[j]), dk[j][0])),
+                );
+                c_prev[j] = c_cur[j];
+                c_cur[j] = c_next;
+            }
+            // SHA-256 of each lane's plaintext (preceded by its 32 prefix bytes at
+            // dst - 32), fed every 128 bytes so the SHA units run alongside the
+            // AES chains instead of in a separate pass afterwards
+            if let Some((sha, hashed)) = hash.as_mut() {
+                let avail = (32 + 16 * (i + 1)) / 128 * 128;
+                for j in 0..N {
+                    if avail > hashed[j] {
+                        let base = dst[j].sub(32);
+                        let blocks = core::slice::from_raw_parts(base.add(hashed[j]), avail - hashed[j]);
+                        super::sha_compress(&mut sha[j], blocks);
+                        hashed[j] = avail;
+                    }
+                }
+            }
+        }
+    }
+
+    #[target_feature(enable = "aes,sse2")]
+    pub unsafe fn ige_dec4(
+        dk: [&Rk; 4],
+        iv: [&[u8]; 4],
+        src: [*const u8; 4],
+        dst: [*mut u8; 4],
+        n: usize,
+        hash: Option<(&mut [[u32; 8]; 4], &mut [usize; 4])>,
+    ) {
+        ige_dec_lanes::<4>(dk, iv, src, dst, n, hash)
     }
 
     #[inline(always)]
@@ -1390,6 +1465,172 @@ fn unpack_message<'py>(
     Ok((msg_id, seq_no, length, body, p.len() - 16))
 }
 
+
+/// Decrypt + verify several packets at once. Independent packets are decrypted
+/// four at a time with interleaved AES-IGE chains (see `ni::ige_dec_lanes`);
+/// everything else (checks, SHA-256, error rules) matches `unpack_core`.
+pub(crate) fn unpack_batch_core(
+    packets: &[&[u8]],
+    session_id: &[u8],
+    auth_key: &[u8],
+    auth_key_id: &[u8],
+    incoming: bool,
+) -> Vec<Result<Vec<u8>, &'static str>> {
+    let mut out: Vec<Option<Result<Vec<u8>, &'static str>>> = (0..packets.len()).map(|_| None).collect();
+
+    #[cfg(target_arch = "x86_64")]
+    if use_ni() {
+        struct Job {
+            idx: usize,
+            msg_key: [u8; 16],
+            iv: [u8; 32],
+            dk: ni::Rk,
+            buf: Vec<u8>,
+            total: usize,
+            sha: [u32; 8],
+            hashed: usize,
+        }
+        let x = if incoming { 8 } else { 0 };
+        let mut jobs: Vec<Job> = Vec::new();
+
+        for (idx, packed) in packets.iter().enumerate() {
+            let early = if packed.len() < 24 {
+                Some("packed data too short")
+            } else if packed[..8] != *auth_key_id {
+                Some("auth_key_id mismatch")
+            } else if (packed.len() - 24) % 16 != 0 {
+                Some("msg_key mismatch")
+            } else {
+                None
+            };
+            if let Some(e) = early {
+                out[idx] = Some(Err(e));
+                continue;
+            }
+            let msg_key: [u8; 16] = packed[8..24].try_into().unwrap();
+            let (k, iv) = kdf_raw(auth_key, &msg_key, !incoming);
+            let total = packed.len() - 24;
+            let mut buf: Vec<u8> = Vec::with_capacity(32 + total);
+            unsafe {
+                std::ptr::copy_nonoverlapping(auth_key.as_ptr().add(88 + x), buf.as_mut_ptr(), 32);
+            }
+            let dk = unsafe { ni::dec_keys(&ni::expand(&k)) };
+            jobs.push(Job { idx, msg_key, iv: iv.try_into().unwrap(), dk, buf, total, sha: H0, hashed: 0 });
+        }
+
+        // lockstep groups of 4 over the shortest message of the group, then each
+        // lane finishes its own tail with the single-chain kernel
+        let mut g = 0;
+        while g < jobs.len() {
+            let end = (g + 4).min(jobs.len());
+            let group = &mut jobs[g..end];
+            unsafe {
+                if group.len() == 4 {
+                    let m = group.iter().map(|j| j.total / 16).min().unwrap();
+                    let (a, rest) = group.split_at_mut(1);
+                    let (b, rest) = rest.split_at_mut(1);
+                    let (c, d) = rest.split_at_mut(1);
+                    let (a, b, c, d) = (&mut a[0], &mut b[0], &mut c[0], &mut d[0]);
+                    let srcs = [a.idx, b.idx, c.idx, d.idx].map(|i| packets[i][24..].as_ptr());
+                    let dsts = [a.buf.as_mut_ptr(), b.buf.as_mut_ptr(), c.buf.as_mut_ptr(), d.buf.as_mut_ptr()]
+                        .map(|p| p.add(32));
+                    let mut shas = [a.sha, b.sha, c.sha, d.sha];
+                    let mut hashed = [0usize; 4];
+                    ni::ige_dec4(
+                        [&a.dk, &b.dk, &c.dk, &d.dk],
+                        [&a.iv, &b.iv, &c.iv, &d.iv],
+                        srcs,
+                        dsts,
+                        m,
+                        Some((&mut shas, &mut hashed)),
+                    );
+                    a.sha = shas[0]; b.sha = shas[1]; c.sha = shas[2]; d.sha = shas[3];
+                    a.hashed = hashed[0]; b.hashed = hashed[1]; c.hashed = hashed[2]; d.hashed = hashed[3];
+                    for (lane, j) in [a, b, c, d].into_iter().enumerate() {
+                        let n = j.total / 16;
+                        if n > m {
+                            // resume: iv = [last ciphertext | last plaintext]
+                            let ct = &packets[j.idx][24..];
+                            let mut iv2 = [0u8; 32];
+                            iv2[..16].copy_from_slice(&ct[16 * (m - 1)..16 * m]);
+                            iv2[16..].copy_from_slice(std::slice::from_raw_parts(dsts[lane].add(16 * (m - 1)), 16));
+                            ni::ige_dec(&j.dk, &iv2, ct.as_ptr().add(16 * m), dsts[lane].add(16 * m), n - m, None);
+                        }
+                        j.buf.set_len(32 + j.total);
+                    }
+                } else {
+                    for j in group.iter_mut() {
+                        let ct = &packets[j.idx][24..];
+                        ni::ige_dec(&j.dk, &j.iv, ct.as_ptr(), j.buf.as_mut_ptr().add(32), j.total / 16, None);
+                        j.buf.set_len(32 + j.total);
+                    }
+                }
+            }
+            g = end;
+        }
+
+        for j in jobs {
+            let Job { idx, msg_key, buf, total, mut sha, mut hashed, .. } = j;
+            // whatever the lockstep kernel has not already hashed (tails, singles)
+            let upto = buf.len() / 64 * 64;
+            if upto > hashed {
+                sha_compress(&mut sha, &buf[hashed..upto]);
+                hashed = upto;
+            }
+            let digest = sha_finish(&mut sha, &buf, hashed);
+            out[idx] = Some(if digest[8..24] != msg_key {
+                Err("msg_key mismatch")
+            } else if total < 16 {
+                Err("packed data too short")
+            } else if buf[32 + 8..32 + 16] != *session_id {
+                Err("session_id mismatch")
+            } else if total < 32 {
+                Err("packed data too short")
+            } else {
+                Ok(buf)
+            });
+        }
+    }
+
+    out.into_iter()
+        .enumerate()
+        .map(|(i, r)| r.unwrap_or_else(|| unpack_core(packets[i], session_id, auth_key, auth_key_id, incoming)))
+        .collect()
+}
+
+/// `[unpack_message(p, ...) for p in packets]`, decrypting independent packets
+/// four at a time with interleaved AES chains. Raises on the first bad packet.
+#[pyfunction]
+#[pyo3(signature = (packets, session_id, auth_key, auth_key_id, incoming=true))]
+fn unpack_message_batch<'py>(
+    py: Python<'py>,
+    packets: Vec<PyBackedBytes>,
+    session_id: PyBackedBytes,
+    auth_key: PyBackedBytes,
+    auth_key_id: PyBackedBytes,
+    incoming: bool,
+) -> PyResult<Vec<(i64, i32, u32, Bound<'py, PyBytes>, usize)>> {
+    validate_keys(&session_id, &auth_key, &auth_key_id)?;
+    let total: usize = packets.iter().map(|p| p.len()).sum();
+    let refs: Vec<&[u8]> = packets.iter().map(|p| &p[..]).collect();
+    let results = maybe_nogil(py, total, || unpack_batch_core(&refs, &session_id, &auth_key, &auth_key_id, incoming));
+    let mut v = Vec::with_capacity(results.len());
+    for (i, r) in results.into_iter().enumerate() {
+        let buf = match r {
+            Ok(b) => b,
+            Err(e) => return verr(&format!("packet {i}: {e}")),
+        };
+        let p = &buf[32..];
+        let (msg_id, seq_no, length) = match parse_plain(p) {
+            Ok(t) => t,
+            Err(e) => return verr(&format!("packet {i}: {e}")),
+        };
+        let end = 32usize + length as usize;
+        v.push((msg_id, seq_no, length, PyBytes::new_bound(py, &p[32..end]), p.len() - 16));
+    }
+    Ok(v)
+}
+
 // ---------------------------------------------------------------- diagnostics
 
 /// Which hardware acceleration this build is really using.
@@ -1438,6 +1679,7 @@ fn cbcrypto(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(ctr256_decrypt, m)?)?;
     m.add_function(wrap_pyfunction!(ctr256_encrypt_inplace, m)?)?;
     m.add_function(wrap_pyfunction!(ctr256_decrypt_inplace, m)?)?;
+    m.add_function(wrap_pyfunction!(unpack_message_batch, m)?)?;
     m.add_function(wrap_pyfunction!(ctr256_encrypt_batch, m)?)?;
     m.add_function(wrap_pyfunction!(ctr256_decrypt_batch, m)?)?;
     m.add_function(wrap_pyfunction!(kdf, m)?)?;
@@ -1450,4 +1692,4 @@ fn cbcrypto(m: &Bound<'_, PyModule>) -> PyResult<()> {
     tl::register(m)?;
     let _ = PyOverflowError::new_err("");
     Ok(())
-                }
+    }
