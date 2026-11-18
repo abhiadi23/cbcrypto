@@ -14,7 +14,7 @@ use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -187,44 +187,6 @@ fn read_exact_at(f: &File, mut buf: &mut [u8], mut off: u64) -> std::io::Result<
 // ------------------------------------------------------------------ pacer
 // (see pacer.rs)
 
-// ------------------------------------------------------------------ clock
-
-/// One monotonic, server-aligned clock shared by every connection of a transfer.
-///
-/// msg_ids carry the time, and Telegram rejects ids that are too far off (bad_msg 16/17).
-/// The old code read the wall clock (`SystemTime`) on every send, so a wall-clock step
-/// (NTP correction, VM pause/resume, container migration) shifted every msg_id at once, and
-/// each connection then had to find out separately, through its own rejected message.
-/// Here the wall clock is read exactly once, at the start; after that time only comes from
-/// `Instant`, which never steps. A correction learned by any connection (bad_msg_notification)
-/// is applied to all of them.
-pub struct Clock {
-    epoch: Instant,
-    /// server unix time in ns, minus the time elapsed since `epoch`
-    offset_ns: AtomicI64,
-}
-
-impl Clock {
-    pub fn new(time_offset: f64) -> Self {
-        let wall = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos() as i64;
-        Clock { epoch: Instant::now(), offset_ns: AtomicI64::new(wall + (time_offset * 1e9) as i64) }
-    }
-
-    /// server unix time, ns
-    pub fn now_ns(&self) -> i128 {
-        self.epoch.elapsed().as_nanos() as i128 + self.offset_ns.load(Ordering::Relaxed) as i128
-    }
-
-    /// Re-align to the time carried by a server msg_id (seconds << 32 | fraction).
-    pub fn sync(&self, server_msg_id: i64) {
-        let secs = (server_msg_id >> 32) as i128;
-        let frac = (server_msg_id & 0xffff_ffff) as i128;
-        let server_ns = secs * 1_000_000_000 + ((frac * 1_000_000_000) >> 32);
-        let off = server_ns - self.epoch.elapsed().as_nanos() as i128;
-        self.offset_ns.store(off as i64, Ordering::Relaxed);
-    }
-}
-
 // ------------------------------------------------------------------ MTProto connection
 
 struct CtrSt {
@@ -247,7 +209,7 @@ pub struct ConnCfg {
     pub auth_key_id: Vec<u8>,
     pub salt: i64,
     pub init_prefix: Vec<u8>,
-    pub clock: Arc<Clock>,
+    pub time_offset: f64,
     pub recv_buf: usize,
     pub read_timeout: Duration,
 }
@@ -272,7 +234,7 @@ struct Conn {
     salt: i64,
     seq: u32,
     last_msg_id: i64,
-    clock: Arc<Clock>,
+    time_offset: f64,
     acks: Vec<i64>,
     last_ack: Instant,
     /// true once a real result came back, i.e. the server has seen initConnection
@@ -333,7 +295,7 @@ impl Conn {
             salt: cfg.salt,
             seq: 0,
             last_msg_id: 0,
-            clock: cfg.clock.clone(),
+            time_offset: cfg.time_offset,
             acks: Vec::new(),
             last_ack: Instant::now(),
             inited: false,
@@ -345,7 +307,8 @@ impl Conn {
     /// Server-corrected unix time as a raw msg_id base (seconds << 32 | fraction), integer exact:
     /// an f64 cannot hold 2^63-sized ids precisely enough to keep two sends apart.
     fn time_id(&self) -> i64 {
-        let nanos = self.clock.now_ns();
+        let d = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+        let nanos = d.as_nanos() as i128 + (self.time_offset * 1e9) as i128;
         let secs = nanos.div_euclid(1_000_000_000);
         let frac = (nanos.rem_euclid(1_000_000_000) << 32) / 1_000_000_000;
         ((secs << 32) | frac) as i64
@@ -361,8 +324,8 @@ impl Conn {
     }
 
     fn sync_time(&mut self, server_msg_id: i64) {
-        // the clock is shared: one rejected message corrects every connection of the transfer
-        self.clock.sync(server_msg_id);
+        let wall = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0);
+        self.time_offset = (server_msg_id >> 32) as f64 - wall;
         // Forget the "last id" guard only if our earlier ids ran AHEAD of the corrected clock
         // (they would otherwise keep us in the future). Resetting it unconditionally let two
         // messages share an id when several bad_msg_notifications arrived back to back.
@@ -745,8 +708,6 @@ fn run_session(sh: &Shared, cfg: &TransferCfg, c: &mut Conn, inflight: &mut Hash
         let mut acts: Vec<Act> = Vec::new();
         let mut fatal: Option<EngineError> = None;
         let mut reconnect = false;
-        // longest flood wait seen in this batch of replies (they all expire together)
-        let mut batch_wait = 0.0f64;
         let recv = c.recv_events(&mut |ev| {
             match ev {
                 Event::File { req, data } if cfg.mode == Mode::Download => {
@@ -784,14 +745,10 @@ fn run_session(sh: &Shared, cfg: &TransferCfg, c: &mut Conn, inflight: &mut Hash
                     if let Some(idx) = inflight.remove(&req) {
                         if let Some(secs) = parse_flood(&message) {
                             let mut slept = sh.flood_slept.lock().unwrap();
-                            // only the part that lengthens this connection's wait counts: three
-                            // FLOOD_WAIT_10 in one batch are one 10 s pause, not 30 s
-                            let extra = (secs - batch_wait).max(0.0);
-                            if secs > sh.flood_each_cap || *slept + extra > sh.flood_total_cap {
+                            if secs > sh.flood_each_cap || *slept + secs > sh.flood_total_cap {
                                 fatal = Some(EngineError::Rpc { code, message });
                             } else {
-                                *slept += extra;
-                                batch_wait = batch_wait.max(secs);
+                                *slept += secs;
                                 if let Some(p) = &sh.pacer {
                                     p.on_flood();
                                 }
@@ -837,16 +794,10 @@ fn run_session(sh: &Shared, cfg: &TransferCfg, c: &mut Conn, inflight: &mut Hash
         if reconnect {
             return Err(EngineError::Io("server asked for a fresh session".into()));
         }
-        // retries that need no wait (bad salt, bad msg id) go out first; everything that is
-        // waiting on a flood sleeps ONCE for the whole batch, then goes out together
-        let (ready, delayed): (Vec<Act>, Vec<Act>) = acts.into_iter().partition(|a| a.1 <= 0.0);
-        let n_ready = ready.len();
-        let mut acts: VecDeque<Act> = ready.into();
-        acts.extend(delayed);
-        let mut sent = 0usize;
+        let mut acts: VecDeque<Act> = acts.into();
         while let Some(Act(idx, secs)) = acts.pop_front() {
             let step = (|| -> Res<()> {
-                if secs > 0.0 && sent == n_ready && !sh.sleep_cancellable(batch_wait) {
+                if secs > 0.0 && !sh.sleep_cancellable(secs) {
                     return Err(EngineError::Cancelled);
                 }
                 let mid = send_chunk(sh, cfg, c, idx)?;
@@ -855,7 +806,6 @@ fn run_session(sh: &Shared, cfg: &TransferCfg, c: &mut Conn, inflight: &mut Hash
                 }
                 Ok(())
             })();
-            sent += 1;
             if let Err(e) = step {
                 sh.requeue(idx);
                 for Act(i, _) in acts.drain(..) {
@@ -1077,7 +1027,7 @@ fn download(
     let file = std::fs::OpenOptions::new().write(true).open(&path).map_err(|e| to_pyerr(ioerr(e)))?;
     let cfg = TransferCfg {
         conn: ConnCfg {
-            host, port, auth_key, auth_key_id, salt, init_prefix, clock: Arc::new(Clock::new(time_offset)), recv_buf: recv_buffer,
+            host, port, auth_key, auth_key_id, salt, init_prefix, time_offset, recv_buf: recv_buffer,
             read_timeout: Duration::from_secs_f64(read_timeout),
         },
         mode: Mode::Download,
@@ -1141,7 +1091,7 @@ fn upload(
     let file = File::open(&path).map_err(|e| to_pyerr(ioerr(e)))?;
     let cfg = TransferCfg {
         conn: ConnCfg {
-            host, port, auth_key, auth_key_id, salt, init_prefix, clock: Arc::new(Clock::new(time_offset)), recv_buf: recv_buffer,
+            host, port, auth_key, auth_key_id, salt, init_prefix, time_offset, recv_buf: recv_buffer,
             read_timeout: Duration::from_secs_f64(read_timeout),
         },
         mode: Mode::Upload,
@@ -1184,31 +1134,4 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(_constants, m)?)?;
     m.add("CoreError", m.py().get_type_bound::<CoreError>())?;
     Ok(())
-                  }
-
-#[cfg(test)]
-mod clock_tests {
-    use super::*;
-
-    #[test]
-    fn follows_server_time_and_never_goes_backwards() {
-        let c = Clock::new(-216.0);
-        let a = c.now_ns();
-        std::thread::sleep(Duration::from_millis(20));
-        let b = c.now_ns();
-        assert!(b > a && b - a >= 15_000_000);
-        // wall clock minus 216 s, to within a second
-        let wall = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as i128;
-        assert!((wall - b - 216_000_000_000).abs() < 1_000_000_000);
     }
-
-    #[test]
-    fn sync_realigns_to_the_server_msg_id() {
-        let c = Clock::new(0.0);
-        let server_secs: i64 = 1_800_000_000;
-        c.sync((server_secs << 32) | (1u64 << 31) as i64); // .5 s
-        let ns = c.now_ns();
-        let want = server_secs as i128 * 1_000_000_000 + 500_000_000;
-        assert!(ns >= want && ns - want < 50_000_000, "off by {} ns", ns - want);
-    }
-               }
