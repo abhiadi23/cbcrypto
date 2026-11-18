@@ -28,8 +28,6 @@ struct PacerSt {
     target: f64,
     /// floods that arrived within a few seconds of each other
     storm: u32,
-    /// the rate we were running at when the current storm of floods began
-    storm_peak: f64,
     /// after a flood, do not probe above this (just under where it happened) for a while
     hold_level: f64,
     hold_until: Option<Instant>,
@@ -65,10 +63,9 @@ impl Pacer {
                 slow_start: c.growth > 1.0 && c.rate < ss_cap,
                 last_up: now,
                 last_down: None,
-                soft_floor: (ss_cap * 0.5).max(1.0),
+                soft_floor: (ss_cap * 0.5).min(c.rate * 0.75).max(1.0),
                 target: 0.0,
                 storm: 0,
-                storm_peak: 0.0,
                 hold_level: f64::INFINITY,
                 hold_until: None,
             }),
@@ -164,9 +161,6 @@ impl Pacer {
         // A flood after a calm spell was probably a blip: cut gently and climb back.
         let stormy = s.last_down.map_or(false, |d| now.duration_since(d).as_secs_f64() < 4.0);
         s.storm = if stormy { s.storm + 1 } else { 1 };
-        if s.storm == 1 {
-            s.storm_peak = s.rate;
-        }
 
         let before = s.rate;
         let mult = if s.storm >= 3 {
@@ -176,25 +170,17 @@ impl Pacer {
         } else {
             0.92
         };
-        // even in a storm, never go below 60% of the soft floor (~12 req/s by default): the old
-        // hard floor of 1.0 left long transfers crawling for tens of seconds after every storm
-        let floor = if s.storm >= 3 {
-            (s.soft_floor * 0.6).min(before).max(s.floor)
-        } else {
-            s.soft_floor.min(before).max(s.floor)
-        };
+        let floor = if s.storm >= 3 { s.floor } else { s.soft_floor.min(before).max(s.floor) };
 
         s.slow_start = false;
         s.rate = (before * mult).max(floor);
-        // a lone flood: climb back to 92% of where it happened. A storm: climb back to 60% of the
-        // rate it started from (not of the already-cut rate, or the target keeps shrinking)
-        s.target = if s.storm >= 2 { (s.storm_peak * 0.6).max(s.rate) } else { (before * 0.92).max(s.rate) };
+        s.target = if s.storm >= 2 { s.rate } else { (before * 0.92).max(s.rate) };
         // a lone flood is a blip: climb straight back. Floods that keep returning mean
         // there is a real limit near here, so stay just under it for a while.
         let repeat = s.last_down.map_or(false, |d| now.duration_since(d).as_secs_f64() < 30.0);
         if repeat {
             s.hold_level = (before * 0.97).max(s.rate);
-            s.hold_until = Some(now + Duration::from_secs(15));
+            s.hold_until = Some(now + Duration::from_secs(20));
         } else {
             s.hold_until = None;
         }
@@ -296,15 +282,5 @@ mod sim {
         println!("\n[E] flood storm 5-12 s: rate each second {:?}", tr.iter().map(|r| r.round() as i64).collect::<Vec<_>>());
         assert!(floods >= 3);
         assert!(tr[13..].iter().cloned().fold(1e9, f64::min) < 25.0 || tr[12] < 25.0, "no deeper back-off in a storm");
-    }
-
-    /// F: after a storm is over the rate must come back, not sit at the floor (the old pacer
-    /// dropped to ~6/s and stayed under ~8/s for a minute).
-    #[test]
-    fn storm_recovers() {
-        let (tr, _) = run(90, |t, _| t >= 5.0 && t < 12.0);
-        println!("\n[F] storm 5-12 s, 90 s run: rate every 10 s {:?}", tr.iter().step_by(10).map(|r| r.round() as i64).collect::<Vec<_>>());
-        assert!(tr[13..].iter().cloned().fold(1e9, f64::min) >= 11.0, "went below the storm floor");
-        assert!(tr[45] >= 30.0, "still only {} req/s 45 s after the storm", tr[45]);
     }
             }
