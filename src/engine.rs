@@ -20,6 +20,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use pyo3::prelude::*;
 
+use crate::pacer::{Pacer, PacerCfg};
 use crate::{ctr_apply, pack_fill, packed_len, parse_plain, unpack_core};
 
 pyo3::create_exception!(cbcrypto, CoreError, pyo3::exceptions::PyException);
@@ -184,127 +185,7 @@ fn read_exact_at(f: &File, mut buf: &mut [u8], mut off: u64) -> std::io::Result<
 }
 
 // ------------------------------------------------------------------ pacer
-
-/// Port of the Python `AdaptiveBucket` (token bucket + slow start + additive increase,
-/// multiplicative decrease), shared by all connections of one transfer.
-pub struct Pacer {
-    st: Mutex<PacerSt>,
-}
-
-struct PacerSt {
-    rate: f64,
-    burst: f64,
-    tokens: f64,
-    last_refill: Instant,
-    ceiling: f64,
-    floor: f64,
-    step: f64,
-    backoff: f64,
-    growth: f64,
-    ss_cap: f64,
-    slow_start: bool,
-    last_up: Instant,
-    last_down: Option<Instant>,
-}
-
-pub struct PacerCfg {
-    pub rate: f64,
-    pub burst: f64,
-    pub ceiling: f64,
-    pub step: f64,
-    pub growth: f64,
-    pub slow_start_cap: f64,
-}
-
-impl Pacer {
-    pub fn new(c: &PacerCfg) -> Self {
-        let now = Instant::now();
-        let ss_cap = c.slow_start_cap.min(c.ceiling);
-        Pacer {
-            st: Mutex::new(PacerSt {
-                rate: c.rate,
-                burst: c.burst,
-                tokens: c.burst,
-                last_refill: now,
-                ceiling: c.ceiling,
-                floor: 1.0,
-                step: c.step,
-                backoff: 0.85,
-                growth: c.growth,
-                ss_cap,
-                slow_start: c.growth > 1.0 && c.rate < ss_cap,
-                last_up: now,
-                last_down: None,
-            }),
-        }
-    }
-
-    fn refill(s: &mut PacerSt) {
-        let now = Instant::now();
-        let el = now.duration_since(s.last_refill).as_secs_f64();
-        s.tokens = s.burst.min(s.tokens + el * s.rate);
-        s.last_refill = now;
-    }
-
-    /// Block until one request may be sent. False if the transfer was cancelled meanwhile.
-    pub fn acquire(&self, cancel: &AtomicBool) -> bool {
-        loop {
-            if cancel.load(Ordering::Relaxed) {
-                return false;
-            }
-            let wait = {
-                let mut s = self.st.lock().unwrap();
-                Self::refill(&mut s);
-                if s.tokens >= 1.0 {
-                    s.tokens -= 1.0;
-                    return true;
-                }
-                (1.0 - s.tokens) / s.rate.max(0.001)
-            };
-            std::thread::sleep(Duration::from_secs_f64(wait.min(0.05)));
-        }
-    }
-
-    pub fn on_success(&self) {
-        let mut s = self.st.lock().unwrap();
-        let now = Instant::now();
-        if s.slow_start {
-            if now.duration_since(s.last_up).as_secs_f64() >= 0.25 {
-                s.last_up = now;
-                Self::refill(&mut s);
-                let nr = (s.rate * s.growth).min(s.ss_cap);
-                if nr >= s.ss_cap {
-                    s.slow_start = false;
-                }
-                s.rate = nr;
-            }
-            return;
-        }
-        let down_ok = s.last_down.map_or(true, |d| now.duration_since(d).as_secs_f64() >= 2.0);
-        if now.duration_since(s.last_up).as_secs_f64() >= 1.0 && down_ok {
-            s.last_up = now;
-            Self::refill(&mut s);
-            s.rate = (s.rate + s.step).min(s.ceiling);
-        }
-    }
-
-    pub fn on_flood(&self) {
-        let mut s = self.st.lock().unwrap();
-        let now = Instant::now();
-        if s.last_down.map_or(true, |d| now.duration_since(d).as_secs_f64() >= 1.0) {
-            s.last_down = Some(now);
-            s.last_up = now;
-            Self::refill(&mut s);
-            if s.slow_start {
-                s.slow_start = false;
-                s.rate = (s.rate * 0.5).max(s.floor);
-            } else {
-                s.rate = (s.rate * s.backoff).max(s.floor);
-            }
-        }
-    }
-
-}
+// (see pacer.rs)
 
 // ------------------------------------------------------------------ MTProto connection
 
@@ -1253,4 +1134,4 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(_constants, m)?)?;
     m.add("CoreError", m.py().get_type_bound::<CoreError>())?;
     Ok(())
-}
+                  }
