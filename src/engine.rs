@@ -582,6 +582,15 @@ impl Shared {
         self.retry.lock().unwrap().push_back(i);
     }
 
+    /// How many chunks one connection may have in flight: its equal share of the chunks nobody
+    /// has been given yet (never less than 1, never more than the configured window).
+    fn fair_share(&self) -> usize {
+        let unassigned = self.total.saturating_sub(self.next.load(Ordering::Relaxed))
+            + self.retry.lock().unwrap().len();
+        let active = self.active.load(Ordering::Relaxed).max(1);
+        ((unassigned + active - 1) / active).max(1)
+    }
+
     fn sleep_cancellable(&self, secs: f64) -> bool {
         let end = Instant::now() + Duration::from_secs_f64(secs);
         while Instant::now() < end {
@@ -668,8 +677,12 @@ fn run_session(sh: &Shared, cfg: &TransferCfg, c: &mut Conn, inflight: &mut Hash
         if sh.cancel.load(Ordering::Relaxed) {
             return Err(EngineError::Cancelled);
         }
-        // fill the pipeline
-        while inflight.len() < cfg.inflight {
+        // fill the pipeline, but only with this connection's fair share of what is still unassigned:
+        // otherwise the first connection to come up takes `inflight` chunks of a small file all by
+        // itself (4 chunks = 3 serial on one connection) and the other connections sit idle, and at
+        // the end of a transfer one connection is left with the whole tail
+        let window = cfg.inflight.min(sh.fair_share());
+        while inflight.len() < window {
             let Some(idx) = sh.take() else { break };
             if let Some(p) = &sh.pacer {
                 if !p.acquire(&sh.cancel) {
@@ -799,6 +812,13 @@ fn run_session(sh: &Shared, cfg: &TransferCfg, c: &mut Conn, inflight: &mut Hash
             let step = (|| -> Res<()> {
                 if secs > 0.0 && !sh.sleep_cancellable(secs) {
                     return Err(EngineError::Cancelled);
+                }
+                // a retry is a request like any other: without this, every chunk that was refused
+                // at the same moment comes back at the same instant, as an unpaced burst
+                if let Some(p) = &sh.pacer {
+                    if !p.acquire(&sh.cancel) {
+                        return Err(EngineError::Cancelled);
+                    }
                 }
                 let mid = send_chunk(sh, cfg, c, idx)?;
                 if let Some(old) = inflight.insert(mid, idx) {
@@ -1134,4 +1154,4 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(_constants, m)?)?;
     m.add("CoreError", m.py().get_type_bound::<CoreError>())?;
     Ok(())
-    }
+        }
