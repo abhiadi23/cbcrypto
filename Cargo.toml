@@ -1,6 +1,6 @@
 [package]
 name = "cbcrypto"
-version = "0.3.0"
+version = "0.4.1"
 edition = "2021"
 description = "Rust core for cbgram: MTProto crypto (AES-256-IGE/CTR with AES-NI/VAES/AVX-512, KDF, fused pack/unpack) and the file download/upload engine"
 license = "LGPL-3.0-or-later"
