@@ -15,7 +15,7 @@ use std::fs::File;
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use pyo3::prelude::*;
@@ -544,7 +544,7 @@ struct Shared {
     next: AtomicUsize,
     total: usize,
     retry: Mutex<VecDeque<usize>>,
-    pacer: Option<Pacer>,
+    pacer: Option<Arc<Pacer>>,
     flood_slept: Mutex<f64>,
     server_errs: AtomicUsize,
     completed: AtomicUsize,
@@ -763,7 +763,7 @@ fn run_session(sh: &Shared, cfg: &TransferCfg, c: &mut Conn, inflight: &mut Hash
                             } else {
                                 *slept += secs;
                                 if let Some(p) = &sh.pacer {
-                                    p.on_flood();
+                                    p.on_flood_wait(secs);
                                 }
                                 acts.push(Act(idx, secs));
                             }
@@ -901,6 +901,30 @@ fn worker(sh: Arc<Shared>, cfg: TransferCfg) {
 // ------------------------------------------------------------------ python entry points
 
 #[allow(clippy::too_many_arguments)]
+/// One pacer per (account auth key, direction), shared by every transfer running on that account at
+/// the same time and kept for a while after, so what was learned about the limit is not thrown away.
+/// Telegram judges the *account*: three files uploading at once with a pacer each ask for three times
+/// the allowed rate, which is exactly what produced the flood storms. Off with CBCRYPTO_SHARED_PACER=0.
+type PacerKey = (Vec<u8>, bool);
+const PACER_KEEP: Duration = Duration::from_secs(120);
+
+fn shared_pacer(key: PacerKey, c: &PacerCfg) -> Arc<Pacer> {
+    static REG: OnceLock<Mutex<HashMap<PacerKey, (Arc<Pacer>, Instant)>>> = OnceLock::new();
+    let mut reg = REG.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap();
+    let now = Instant::now();
+    reg.retain(|_, (p, used)| Arc::strong_count(p) > 1 || now.duration_since(*used) < PACER_KEEP);
+    let slot = reg.entry(key).or_insert_with(|| (Arc::new(Pacer::new(c)), now));
+    slot.1 = now;
+    slot.0.clone()
+}
+
+fn make_pacer(cfg: &TransferCfg, c: &PacerCfg) -> Arc<Pacer> {
+    if std::env::var("CBCRYPTO_SHARED_PACER").map_or(false, |v| v == "0") {
+        return Arc::new(Pacer::new(c));
+    }
+    shared_pacer((cfg.conn.auth_key_id.clone(), cfg.mode == Mode::Upload), c)
+}
+
 fn run_transfer(
     py: Python<'_>,
     cfg: TransferCfg,
@@ -924,7 +948,7 @@ fn run_transfer(
         next: AtomicUsize::new(first_unit),
         total: total_units,
         retry: Mutex::new(VecDeque::new()),
-        pacer: pacer.as_ref().map(Pacer::new),
+        pacer: pacer.as_ref().map(|c| make_pacer(&cfg, c)),
         flood_slept: Mutex::new(0.0),
         server_errs: AtomicUsize::new(0),
         completed: AtomicUsize::new(0),
@@ -998,8 +1022,8 @@ fn run_transfer(
     Ok(done)
 }
 
-fn pacer_cfg(paced: bool, rate: f64, burst: f64, ceiling: f64, step: f64, growth: f64, cap: f64) -> Option<PacerCfg> {
-    paced.then_some(PacerCfg { rate, burst, ceiling, step, growth, slow_start_cap: cap })
+fn pacer_cfg(paced: bool, rate: f64, burst: f64, ceiling: f64, step: f64, growth: f64, cap: f64, floor: f64) -> Option<PacerCfg> {
+    paced.then_some(PacerCfg { rate, burst, ceiling, step, growth, slow_start_cap: cap, hard_floor: floor })
 }
 
 #[pyfunction]
@@ -1007,7 +1031,7 @@ fn pacer_cfg(paced: bool, rate: f64, burst: f64, ceiling: f64, step: f64, growth
                     start_offset=0, chunk_size=1048576, connections=5, inflight=3, paced=true,
                     rate=8.0, burst=8.0, ceiling=150.0, step=0.5, growth=1.5, slow_start_cap=40.0,
                     progress=None, time_offset=0.0, recv_buffer=0, read_timeout=30.0,
-                    flood_each_cap=30.0, flood_total_cap=300.0, max_reconnects=5))]
+                    flood_each_cap=30.0, flood_total_cap=300.0, max_reconnects=5, floor=1.0))]
 #[allow(clippy::too_many_arguments)]
 fn download(
     py: Python<'_>,
@@ -1038,6 +1062,7 @@ fn download(
     flood_each_cap: f64,
     flood_total_cap: f64,
     max_reconnects: u32,
+    floor: f64,
 ) -> PyResult<u64> {
     check_common(&auth_key, &auth_key_id, chunk_size)?;
     if start_offset % chunk_size != 0 || start_offset >= file_size {
@@ -1060,7 +1085,7 @@ fn download(
     };
     run_transfer(
         py, cfg, file, file_size, chunk_size, start_offset, total, 0, connections,
-        pacer_cfg(paced, rate, burst, ceiling, step, growth, slow_start_cap),
+        pacer_cfg(paced, rate, burst, ceiling, step, growth, slow_start_cap, floor),
         flood_each_cap, flood_total_cap, progress,
     )
 }
@@ -1070,7 +1095,7 @@ fn download(
                     part_size=524288, start_part=0, is_big=true, connections=5, inflight=3, paced=true,
                     rate=32.0, burst=16.0, ceiling=300.0, step=1.0, growth=1.5, slow_start_cap=80.0,
                     progress=None, time_offset=0.0, recv_buffer=0, read_timeout=30.0,
-                    flood_each_cap=30.0, flood_total_cap=300.0, max_reconnects=5))]
+                    flood_each_cap=30.0, flood_total_cap=300.0, max_reconnects=5, floor=1.0))]
 #[allow(clippy::too_many_arguments)]
 fn upload(
     py: Python<'_>,
@@ -1102,6 +1127,7 @@ fn upload(
     flood_each_cap: f64,
     flood_total_cap: f64,
     max_reconnects: u32,
+    floor: f64,
 ) -> PyResult<u64> {
     check_common(&auth_key, &auth_key_id, part_size)?;
     let total_parts = file_size.div_ceil(part_size) as usize;
@@ -1124,7 +1150,7 @@ fn upload(
     };
     run_transfer(
         py, cfg, file, file_size, part_size, 0, total_parts, start_part, connections,
-        pacer_cfg(paced, rate, burst, ceiling, step, growth, slow_start_cap),
+        pacer_cfg(paced, rate, burst, ceiling, step, growth, slow_start_cap, floor),
         flood_each_cap, flood_total_cap, progress,
     )
 }
@@ -1155,3 +1181,25 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("CoreError", m.py().get_type_bound::<CoreError>())?;
     Ok(())
         }
+
+#[cfg(test)]
+mod shared_pacer_tests {
+    use super::*;
+
+    fn cfg() -> PacerCfg {
+        PacerCfg { rate: 45.0, burst: 8.0, ceiling: 60.0, step: 0.5, growth: 1.1, slow_start_cap: 60.0, hard_floor: 20.0 }
+    }
+
+    #[test]
+    fn same_account_shares_one_pacer_others_do_not() {
+        let a1 = shared_pacer((vec![1; 8], true), &cfg());
+        let a2 = shared_pacer((vec![1; 8], true), &cfg());
+        let down = shared_pacer((vec![1; 8], false), &cfg());
+        let b = shared_pacer((vec![2; 8], true), &cfg());
+        assert!(Arc::ptr_eq(&a1, &a2), "two uploads of one account must share a pacer");
+        assert!(!Arc::ptr_eq(&a1, &down), "upload and download are judged separately");
+        assert!(!Arc::ptr_eq(&a1, &b), "another bot has its own limit");
+        a1.on_flood_wait(0.0);
+        assert!(a2.rate() < 45.0, "a flood seen by one upload slows the other");
+    }
+    }
