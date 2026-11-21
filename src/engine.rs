@@ -256,6 +256,15 @@ impl Conn {
             .ok_or_else(|| EngineError::Io("address did not resolve".into()))?;
         let s = TcpStream::connect_timeout(&addr, Duration::from_secs(10)).map_err(ioerr)?;
         let _ = s.set_nodelay(true);
+        // BBR ramps up faster and holds its speed on a long or slightly lossy path (cubic backs off on
+        // every loss). Best effort: a kernel or sandbox without it just keeps its default.
+        #[cfg(target_os = "linux")]
+        {
+            let cc = std::env::var("CBCRYPTO_TCP_CC").unwrap_or_else(|_| "bbr".into());
+            if !cc.is_empty() && cc != "off" {
+                let _ = socket2::SockRef::from(&s).set_tcp_congestion(cc.as_bytes());
+            }
+        }
         if cfg.recv_buf > 0 {
             let _ = socket2::SockRef::from(&s).set_recv_buffer_size(cfg.recv_buf);
         }
@@ -1201,5 +1210,21 @@ mod shared_pacer_tests {
         assert!(!Arc::ptr_eq(&a1, &b), "another bot has its own limit");
         a1.on_flood_wait(0.0);
         assert!(a2.rate() < 45.0, "a flood seen by one upload slows the other");
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tcp_cc_tests {
+    #[test]
+    fn bbr_is_applied_when_the_kernel_has_it() {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let s = std::net::TcpStream::connect(l.local_addr().unwrap()).unwrap();
+        let avail = std::fs::read_to_string("/proc/sys/net/ipv4/tcp_available_congestion_control").unwrap_or_default();
+        let r = socket2::SockRef::from(&s).set_tcp_congestion(b"bbr");
+        if avail.split_whitespace().any(|a| a == "bbr") {
+            r.expect("bbr is available but could not be set");
+            let got = socket2::SockRef::from(&s).tcp_congestion().unwrap();
+            assert!(got.starts_with(b"bbr"), "socket reports {:?}", String::from_utf8_lossy(&got));
+        } // else: a kernel without bbr must simply fail quietly, which is what connect() relies on
     }
     }
