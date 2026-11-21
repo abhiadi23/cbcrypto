@@ -25,6 +25,10 @@ struct PacerSt {
     last_down: Option<Instant>,
     /// never cut below this (unless floods keep coming back-to-back)
     soft_floor: f64,
+    /// what a flood *storm* may cut to (the "dip" level); only a long unbroken storm goes lower
+    hard_floor: f64,
+    /// every connection holds still until here after a flood (one shared cooldown, paid once)
+    pause_until: Option<Instant>,
     /// after a flood, climb back quickly to here (a little under where it happened)
     target: f64,
     /// floods that arrived within a few seconds of each other
@@ -45,6 +49,8 @@ pub struct PacerCfg {
     pub step: f64,
     pub growth: f64,
     pub slow_start_cap: f64,
+    /// lowest rate a flood storm cuts to before it is judged a real server limit (requests/s)
+    pub hard_floor: f64,
 }
 
 impl Pacer {
@@ -68,7 +74,9 @@ impl Pacer {
                 slow_start: c.growth > 1.0 && c.rate < ss_cap,
                 last_up: now,
                 last_down: None,
-                soft_floor: (ss_cap * 0.5).min(c.rate * 0.75).max(1.0),
+                soft_floor: (ss_cap * 0.4).min(c.rate * 0.6).max(1.0),
+                hard_floor: c.hard_floor.max(1.0).min(ss_cap * 0.4),
+                pause_until: None,
                 target: 0.0,
                 storm: 0,
                 hold_level: f64::INFINITY,
@@ -117,6 +125,18 @@ impl Pacer {
             }
             let wait = {
                 let mut s = self.st.lock().unwrap();
+                let now = Instant::now();
+                if let Some(t) = s.pause_until {
+                    if now < t {
+                        let left = t.duration_since(now).as_secs_f64();
+                        drop(s);
+                        std::thread::sleep(Duration::from_secs_f64(left.min(0.05)));
+                        continue;
+                    }
+                    s.pause_until = None;
+                    s.tokens = 0.0; // no burst when the cooldown ends
+                    s.last_refill = now;
+                }
                 Self::refill(&mut s, Instant::now());
                 if s.tokens >= 1.0 {
                     s.tokens -= 1.0;
@@ -170,12 +190,26 @@ impl Pacer {
         if now.duration_since(s.last_up).as_secs_f64() >= 1.0 && since_down >= 2.0 {
             s.last_up = now;
             Self::refill(&mut s, now);
-            s.rate = (s.rate + s.step).min(cap).max(s.rate.min(cap));
+            let inc = s.step.max(s.rate * 0.03); // ~3%/s: a dip at 20 is back above 30 in ~15 s
+            s.rate = (s.rate + inc).min(cap).max(s.rate.min(cap));
         }
     }
 
     pub fn on_flood(&self) {
         self.on_flood_at(Instant::now());
+    }
+
+    /// A flood with a known wait: cut the rate as `on_flood` does AND hold *every* connection for
+    /// the wait. Without the shared hold only the connection that got the error sleeps while the
+    /// others keep sending into the penalty, which is what makes Telegram stretch it.
+    pub fn on_flood_wait(&self, secs: f64) {
+        let now = Instant::now();
+        self.on_flood_at(now);
+        let until = now + Duration::from_secs_f64(secs.max(0.0).min(60.0));
+        let mut s = self.st.lock().unwrap();
+        if s.pause_until.map_or(true, |t| until > t) {
+            s.pause_until = Some(until);
+        }
     }
 
     /// current request rate (requests/s)
@@ -206,7 +240,15 @@ impl Pacer {
         };
 
         let mult = if s.storm >= 3 { 0.7 } else { 0.8 };
-        let floor = if s.storm >= 3 { s.floor } else { s.soft_floor.min(level).max(s.floor) };
+        // blip: stay above the soft floor. storm: may dip to the hard floor ("dip" band). Only a long
+        // unbroken storm (the server really refuses this rate) is allowed all the way down.
+        let floor = if s.storm >= 8 {
+            s.floor
+        } else if s.storm >= 3 {
+            s.hard_floor.min(level).max(s.floor)
+        } else {
+            s.soft_floor.min(level).max(s.floor)
+        };
 
         s.slow_start = false;
         s.rate = (level.min(s.rate.max(level)) * mult).max(floor).min(s.rate.max(floor));
@@ -230,14 +272,15 @@ impl Pacer {
 mod sim {
     use super::*;
 
-    /// The stable band used for bots and normal accounts: start 32/s, never above 50/s (1 MiB chunks).
+    /// The band used for bots and normal accounts (1 MiB chunks): start 45/s, never above 60/s,
+    /// storms may dip to 20/s.
     fn band() -> PacerCfg {
-        PacerCfg { rate: 32.0, burst: 8.0, ceiling: 50.0, step: 0.5, growth: 1.1, slow_start_cap: 50.0 }
+        PacerCfg { rate: 45.0, burst: 8.0, ceiling: 60.0, step: 0.5, growth: 1.1, slow_start_cap: 60.0, hard_floor: 20.0 }
     }
 
     /// What the engine used before: start at 8/s, slow start to 40/s, then probe slowly up to 150/s.
     fn legacy_cfg() -> PacerCfg {
-        PacerCfg { rate: 8.0, burst: 8.0, ceiling: 150.0, step: 0.5, growth: 1.5, slow_start_cap: 40.0 }
+        PacerCfg { rate: 8.0, burst: 8.0, ceiling: 150.0, step: 0.5, growth: 1.5, slow_start_cap: 40.0, hard_floor: 1.0 }
     }
 
     /// Drive the pacer for `secs` seconds in 50 ms ticks, sending at the pacer's current rate.
@@ -284,9 +327,9 @@ mod sim {
         let (tr, floods) = run(60, |_, _| false);
         println!("\n[A] no floods: rate each 10 s {:?}  max {:.0}", trace10(&tr), max(&tr));
         assert_eq!(floods, 0);
-        assert!(tr[1] >= 45.0, "must be at speed within a second, small files cannot wait: {}", tr[1]);
-        assert!(max(&tr) <= 50.0 + 1e-9, "never above the cap");
-        assert!(avg(&tr[1..]) >= 48.0);
+        assert!(tr[1] >= 50.0, "must be at speed within a second, small files cannot wait: {}", tr[1]);
+        assert!(max(&tr) <= 60.0 + 1e-9, "never above the cap");
+        assert!(avg(&tr[1..]) >= 55.0);
     }
 
     /// Isolated floods (blips) during and after the ramp must not leave the transfer crawling.
@@ -304,9 +347,9 @@ mod sim {
         });
         println!("\n[B] isolated floods at 0.4 s, 40 s, 80 s: rate each 10 s {:?}", trace10(&tr));
         println!("    avg {:.1}/s  min {:.1}/s  floods {}", avg(&tr[1..]), min(&tr[1..]), floods);
-        assert!(min(&tr[1..]) >= 20.0, "never below 20/s on a blip: {}", min(&tr[1..]));
-        assert!(avg(&tr[1..]) >= 30.0 && avg(&tr[1..]) <= 50.0);
-        assert!(tr[10] >= 30.0, "rate 10 s after a flood during the ramp: {}", tr[10]);
+        assert!(min(&tr[1..]) >= 30.0, "a blip must stay in the 30+ band: {}", min(&tr[1..]));
+        assert!(avg(&tr[1..]) >= 40.0 && avg(&tr[1..]) <= 60.0);
+        assert!(tr[10] >= 40.0, "rate 10 s after a flood during the ramp: {}", tr[10]);
     }
 
     /// The server only tolerates 36/s (well inside the band): settle just under it, with few floods.
@@ -335,7 +378,8 @@ mod sim {
         let (tr, floods) = run(40, |t, _| t >= 5.0 && t < 12.0);
         println!("\n[E] flood storm 5-12 s: rate each second {:?}", tr.iter().map(|r| r.round() as i64).collect::<Vec<_>>());
         assert!(floods >= 3);
-        assert!(min(&tr[8..16]) < 24.0, "a real storm must be allowed below the soft floor");
+        assert!(min(&tr[8..16]) < 30.0, "a real storm must be allowed below the soft floor");
+        assert!(min(&tr[8..25]) >= 19.0, "but a short storm dips to the 20-30 band, not to a crawl: {}", min(&tr[8..25]));
     }
 
     /// A slower server limit than the floor (15/s): must still be respected eventually.
@@ -344,6 +388,33 @@ mod sim {
         let (tr, floods) = run(120, |_, r| r > 15.0);
         println!("\n[F] server limit 15/s: rate each 10 s {:?} floods {}", trace10(&tr), floods);
         assert!(avg(&tr[60..]) <= 16.5 && avg(&tr[60..]) >= 12.0);
-        assert!(floods <= 35);
+        assert!(floods <= 40);
     }
-        }
+        
+    /// A flood wait must hold every connection, not only the one that received it, and must not
+    /// release a burst when it ends.
+    #[test]
+    fn flood_wait_pauses_everyone() {
+        use std::sync::atomic::AtomicBool;
+        let p = Pacer::new(&band());
+        let cancel = AtomicBool::new(false);
+        assert!(p.acquire(&cancel));
+        p.on_flood_wait(0.3);
+        let t = Instant::now();
+        assert!(p.acquire(&cancel));
+        let waited = t.elapsed().as_secs_f64();
+        assert!(waited >= 0.25, "acquire must wait out the flood: {waited}");
+        // and no burst after the pause: the second request is spaced by the rate, not free
+        let t = Instant::now();
+        for _ in 0..5 { assert!(p.acquire(&cancel)); }
+        assert!(t.elapsed().as_secs_f64() >= 0.05, "no burst after the cooldown");
+    }
+
+    /// The same 50/s-ish world as production: a storm that clears must climb back into 30+ quickly.
+    #[test]
+    fn recovers_into_the_band_after_a_storm() {
+        let (tr, _) = run(60, |t, _| t >= 5.0 && t < 9.0);
+        println!("\n[G] storm 5-9 s then calm: {:?}", tr.iter().map(|r| r.round() as i64).collect::<Vec<_>>());
+        assert!(tr[25] >= 30.0, "25 s after the storm it is back in the band: {}", tr[25]);
+    }
+            }
