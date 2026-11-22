@@ -926,11 +926,11 @@ fn worker(sh: Arc<Shared>, cfg: TransferCfg) {
 // ------------------------------------------------------------------ python entry points
 
 /// One pacer per (account auth key, direction), shared by every transfer running on that account at
-/// the same time and kept for a while after, so what was learned about the limit is not thrown away.
+/// the same time and kept for ten minutes after, so what was learned about the limit is not thrown away.
 /// Telegram judges the *account*: three files uploading at once with a pacer each ask for three times
 /// the allowed rate, which is exactly what produced the flood storms. Off with CBCRYPTO_SHARED_PACER=0.
 type PacerKey = (Vec<u8>, bool);
-const PACER_KEEP: Duration = Duration::from_secs(120);
+const PACER_KEEP: Duration = Duration::from_secs(600); // what was learned about the limit survives gaps between files
 
 /// A flood wait holds every connection of the account (default). CBCRYPTO_FLOOD_PAUSE=0 makes it hold
 /// only the connection that received it, for comparing the two on a real link.
@@ -1272,4 +1272,4 @@ mod tcp_cc_tests {
             assert!(got.starts_with(b"bbr"), "socket reports {:?}", String::from_utf8_lossy(&got));
         } // else: a kernel without bbr must simply fail quietly, which is what connect() relies on
     }
-}
+    }
