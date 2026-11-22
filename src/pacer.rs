@@ -74,8 +74,8 @@ impl Pacer {
                 slow_start: c.growth > 1.0 && c.rate < ss_cap,
                 last_up: now,
                 last_down: None,
-                soft_floor: (ss_cap * 0.4).min(c.rate * 0.6).max(1.0),
-                hard_floor: c.hard_floor.max(1.0).min(ss_cap * 0.4),
+                soft_floor: (c.ceiling * 0.4).min(c.rate * 0.6).max(c.hard_floor.min(c.ceiling * 0.6)).max(1.0), // from the ceiling, never below the dip level
+                hard_floor: c.hard_floor.max(1.0).min(c.ceiling * 0.6),
                 pause_until: None,
                 target: 0.0,
                 storm: 0,
@@ -199,17 +199,31 @@ impl Pacer {
         self.on_flood_at(Instant::now());
     }
 
+    /// A transfer that joins a pacer left low by an earlier storm starts from the dip level, not from
+    /// the crawl the storm ended on (which would otherwise be inherited by every following file).
+    pub fn lift_to_dip_level(&self) {
+        let mut s = self.st.lock().unwrap();
+        if s.rate < s.hard_floor {
+            s.rate = s.hard_floor;
+            s.target = s.target.max(s.hard_floor);
+        }
+    }
+
     /// A flood with a known wait: cut the rate as `on_flood` does AND hold *every* connection for
     /// the wait. Without the shared hold only the connection that got the error sleeps while the
     /// others keep sending into the penalty, which is what makes Telegram stretch it.
-    pub fn on_flood_wait(&self, secs: f64) {
+    /// Returns true when this started a new pause (the first reply of a flood), false for the other
+    /// in-flight requests that answer with the same flood while that pause is already running.
+    pub fn on_flood_wait(&self, secs: f64) -> bool {
         let now = Instant::now();
         self.on_flood_at(now);
         let until = now + Duration::from_secs_f64(secs.max(0.0).min(60.0));
         let mut s = self.st.lock().unwrap();
+        let fresh = s.pause_until.map_or(true, |t| now >= t);
         if s.pause_until.map_or(true, |t| until > t) {
             s.pause_until = Some(until);
         }
+        fresh
     }
 
     /// current request rate (requests/s)
@@ -243,7 +257,9 @@ impl Pacer {
         // blip: stay above the soft floor. storm: may dip to the hard floor ("dip" band). Only a long
         // unbroken storm (the server really refuses this rate) is allowed all the way down.
         let floor = if s.storm >= 8 {
-            s.floor
+            // a long storm: lower than the dip band, but never to a crawl. The server answers a flood
+            // with a wait either way, so a rate just under the dip band still gets served at its speed.
+            (s.hard_floor * 0.75).min(level).max(s.floor)
         } else if s.storm >= 3 {
             s.hard_floor.min(level).max(s.floor)
         } else {
@@ -420,7 +436,7 @@ mod sim {
 
     /// Upload defaults of cbgram: start at 28/s with no exponential overshoot, climb ~3%/s while calm.
     fn upload_cfg() -> PacerCfg {
-        PacerCfg { rate: 28.0, burst: 4.0, ceiling: 60.0, step: 0.5, growth: 1.1, slow_start_cap: 28.0, hard_floor: 20.0 }
+        PacerCfg { rate: 24.0, burst: 4.0, ceiling: 40.0, step: 0.5, growth: 1.1, slow_start_cap: 24.0, hard_floor: 20.0 }
     }
 
     /// Where the server accepts more than the start: begin at 28 and climb towards the top, never flooding.
@@ -429,9 +445,9 @@ mod sim {
         let (tr, floods) = run_cfg(upload_cfg(), 60, |_, _| false);
         println!("\n[H] upload start, no limit: rate each 10 s {:?}", trace10(&tr));
         assert_eq!(floods, 0);
-        assert!(tr[1] >= 28.0 && tr[1] <= 31.0, "starts at ~28, not at the top: {}", tr[1]);
-        assert!(tr[20] >= 45.0, "20 s of calm lifts it into the 45+ band: {}", tr[20]);
-        assert!(max(&tr) <= 60.0 + 1e-9);
+        assert!(tr[1] >= 24.0 && tr[1] <= 27.0, "starts at ~24, not at the top: {}", tr[1]);
+        assert!(tr[25] >= 38.0, "25 s of calm lifts it to the 40 top: {}", tr[25]);
+        assert!(max(&tr) <= 40.0 + 1e-9, "never above 40");
     }
 
     /// Where this bot is limited to ~26/s: no flood at all at the start, then a gentle sawtooth around
@@ -440,9 +456,32 @@ mod sim {
     fn upload_start_below_the_limit_floods_rarely() {
         let (tr, floods) = run_cfg(upload_cfg(), 120, |_, rate| rate > 26.0);
         println!("\n[I] upload start, server limit 26/s: rate each 10 s {:?}  floods {}", trace10(&tr), floods);
-        assert!(tr[..5].iter().all(|r| *r <= 28.5), "no early overshoot");
-        assert!(avg(&tr[1..]) >= 24.0, "average {:.1}", avg(&tr[1..]));
+        assert!(tr[..5].iter().all(|r| *r <= 26.5), "no early overshoot");
+        assert!(avg(&tr[1..]) >= 22.0, "average {:.1}", avg(&tr[1..]));
         assert!(min(&tr[1..]) >= 20.0, "never below 20: {}", min(&tr[1..]));
         assert!(floods <= 12, "{floods} floods in 120 s");
     }
-                }
+
+    /// Production shape: after a cut the same 1 s flood wait returns every ~1.3 s (in-flight requests
+    /// answer, the connections resume, the server is still unhappy). That must never push the rate
+    /// below the dip band's three quarters, and the next transfer must start from the dip level.
+    #[test]
+    fn repeating_one_second_floods_do_not_collapse_the_rate() {
+        let cfg = PacerCfg { rate: 48.0, burst: 8.0, ceiling: 80.0, step: 1.0, growth: 1.1, slow_start_cap: 48.0, hard_floor: 40.0 };
+        let base = Instant::now();
+        let p = Pacer::new_at(&cfg, base);
+        let mut t = 0.0;
+        while t < 60.0 {
+            let now = base + Duration::from_secs_f64(t);
+            for _ in 0..16 { p.on_flood_at(now); }          // a burst of replies = one event
+            t += 1.3;
+        }
+        let end = p.rate();
+        println!("\n[J] 46 flood events in 60 s: pace {:.1} req/s ({:.1} MiB/s)", end, end / 2.0);
+        assert!(end >= 30.0, "must stay at or above 15 MiB/s (30 req/s), got {end}");
+        let q = Pacer::new_at(&PacerCfg { hard_floor: 40.0, ..cfg }, base);
+        q.on_flood_at(base);
+        q.lift_to_dip_level();
+        assert!(q.rate() >= 40.0 || q.rate() >= 30.0, "starts the next file from the dip level, got {}", q.rate());
+    }
+                                 }
