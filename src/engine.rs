@@ -555,6 +555,7 @@ struct Shared {
     retry: Mutex<VecDeque<usize>>,
     pacer: Option<Arc<Pacer>>,
     flood_slept: Mutex<f64>,
+    flood_events: Mutex<Vec<f64>>,
     floods: AtomicU64,
     flood_ms: AtomicU64,
     flood_max_ms: AtomicU64,
@@ -779,12 +780,13 @@ fn run_session(sh: &Shared, cfg: &TransferCfg, c: &mut Conn, inflight: &mut Hash
                                 sh.floods.fetch_add(1, Ordering::Relaxed);
                                 sh.flood_ms.fetch_add((secs * 1000.0) as u64, Ordering::Relaxed);
                                 sh.flood_max_ms.fetch_max((secs * 1000.0) as u64, Ordering::Relaxed);
-                                if let Some(p) = &sh.pacer {
-                                    if flood_pauses_all() {
-                                        p.on_flood_wait(secs);
-                                    } else {
-                                        p.on_flood();
-                                    }
+                                // one log line per flood (not one per in-flight request that answers with it)
+                                let fresh = match &sh.pacer {
+                                    Some(p) => p.on_flood_wait(secs),
+                                    None => true,
+                                };
+                                if fresh {
+                                    sh.flood_events.lock().unwrap().push(secs);
                                 }
                                 acts.push(Act(idx, secs));
                             }
@@ -932,13 +934,6 @@ fn worker(sh: Arc<Shared>, cfg: TransferCfg) {
 type PacerKey = (Vec<u8>, bool);
 const PACER_KEEP: Duration = Duration::from_secs(600); // what was learned about the limit survives gaps between files
 
-/// A flood wait holds every connection of the account (default). CBCRYPTO_FLOOD_PAUSE=0 makes it hold
-/// only the connection that received it, for comparing the two on a real link.
-fn flood_pauses_all() -> bool {
-    static V: OnceLock<bool> = OnceLock::new();
-    *V.get_or_init(|| std::env::var("CBCRYPTO_FLOOD_PAUSE").map_or(true, |v| v != "0"))
-}
-
 fn shared_pacer(key: PacerKey, c: &PacerCfg) -> Arc<Pacer> {
     static REG: OnceLock<Mutex<HashMap<PacerKey, (Arc<Pacer>, Instant)>>> = OnceLock::new();
     let mut reg = REG.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap();
@@ -953,7 +948,9 @@ fn make_pacer(cfg: &TransferCfg, c: &PacerCfg) -> Arc<Pacer> {
     if std::env::var("CBCRYPTO_SHARED_PACER").map_or(false, |v| v == "0") {
         return Arc::new(Pacer::new(c));
     }
-    shared_pacer((cfg.conn.auth_key_id.clone(), cfg.mode == Mode::Upload), c)
+    let p = shared_pacer((cfg.conn.auth_key_id.clone(), cfg.mode == Mode::Upload), c);
+    p.lift_to_dip_level();
+    p
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -972,6 +969,7 @@ fn run_transfer(
     flood_total_cap: f64,
     progress: Option<PyObject>,
     stats: Option<Py<pyo3::types::PyDict>>,
+    on_flood: Option<PyObject>,
 ) -> PyResult<u64> {
     let sh = Arc::new(Shared {
         cancel: AtomicBool::new(false),
@@ -983,6 +981,7 @@ fn run_transfer(
         retry: Mutex::new(VecDeque::new()),
         pacer: pacer.as_ref().map(|c| make_pacer(&cfg, c)),
         flood_slept: Mutex::new(0.0),
+        flood_events: Mutex::new(Vec::new()),
         floods: AtomicU64::new(0),
         flood_ms: AtomicU64::new(0),
         flood_max_ms: AtomicU64::new(0),
@@ -1028,6 +1027,12 @@ fn run_transfer(
                 break;
             }
         }
+        if let Some(cb) = &on_flood {
+            let evs = std::mem::take(&mut *sh.flood_events.lock().unwrap());
+            for secs in evs {
+                let _ = cb.call1(py, (secs,));
+            }
+        }
         if sh.active.load(Ordering::SeqCst) == 0 {
             break;
         }
@@ -1037,6 +1042,11 @@ fn run_transfer(
             let _ = h.join();
         }
     });
+    if let Some(cb) = &on_flood {
+        for secs in std::mem::take(&mut *sh.flood_events.lock().unwrap()) {
+            let _ = cb.call1(py, (secs,));
+        }
+    }
     if let Some(d) = &stats {
         // what really happened on the wire: lets the caller tell flood waits, reconnects and a slow
         // link apart instead of guessing from the speed curve
@@ -1083,7 +1093,7 @@ fn pacer_cfg(paced: bool, rate: f64, burst: f64, ceiling: f64, step: f64, growth
                     start_offset=0, chunk_size=1048576, connections=5, inflight=3, paced=true,
                     rate=8.0, burst=8.0, ceiling=150.0, step=0.5, growth=1.5, slow_start_cap=40.0,
                     progress=None, time_offset=0.0, recv_buffer=0, read_timeout=30.0,
-                    flood_each_cap=30.0, flood_total_cap=300.0, max_reconnects=5, floor=1.0, stats=None))]
+                    flood_each_cap=30.0, flood_total_cap=300.0, max_reconnects=5, floor=1.0, stats=None, on_flood=None))]
 #[allow(clippy::too_many_arguments)]
 fn download(
     py: Python<'_>,
@@ -1116,6 +1126,7 @@ fn download(
     max_reconnects: u32,
     floor: f64,
     stats: Option<Py<pyo3::types::PyDict>>,
+    on_flood: Option<PyObject>,
 ) -> PyResult<u64> {
     check_common(&auth_key, &auth_key_id, chunk_size)?;
     if start_offset % chunk_size != 0 || start_offset >= file_size {
@@ -1139,7 +1150,7 @@ fn download(
     run_transfer(
         py, cfg, file, file_size, chunk_size, start_offset, total, 0, connections,
         pacer_cfg(paced, rate, burst, ceiling, step, growth, slow_start_cap, floor),
-        flood_each_cap, flood_total_cap, progress, stats,
+        flood_each_cap, flood_total_cap, progress, stats, on_flood,
     )
 }
 
@@ -1148,7 +1159,7 @@ fn download(
                     part_size=524288, start_part=0, is_big=true, connections=5, inflight=3, paced=true,
                     rate=32.0, burst=16.0, ceiling=300.0, step=1.0, growth=1.5, slow_start_cap=80.0,
                     progress=None, time_offset=0.0, recv_buffer=0, read_timeout=30.0,
-                    flood_each_cap=30.0, flood_total_cap=300.0, max_reconnects=5, floor=1.0, stats=None))]
+                    flood_each_cap=30.0, flood_total_cap=300.0, max_reconnects=5, floor=1.0, stats=None, on_flood=None))]
 #[allow(clippy::too_many_arguments)]
 fn upload(
     py: Python<'_>,
@@ -1182,6 +1193,7 @@ fn upload(
     max_reconnects: u32,
     floor: f64,
     stats: Option<Py<pyo3::types::PyDict>>,
+    on_flood: Option<PyObject>,
 ) -> PyResult<u64> {
     check_common(&auth_key, &auth_key_id, part_size)?;
     let total_parts = file_size.div_ceil(part_size) as usize;
@@ -1205,7 +1217,7 @@ fn upload(
     run_transfer(
         py, cfg, file, file_size, part_size, 0, total_parts, start_part, connections,
         pacer_cfg(paced, rate, burst, ceiling, step, growth, slow_start_cap, floor),
-        flood_each_cap, flood_total_cap, progress, stats,
+        flood_each_cap, flood_total_cap, progress, stats, on_flood,
     )
 }
 
@@ -1272,4 +1284,4 @@ mod tcp_cc_tests {
             assert!(got.starts_with(b"bbr"), "socket reports {:?}", String::from_utf8_lossy(&got));
         } // else: a kernel without bbr must simply fail quietly, which is what connect() relies on
     }
-    }
+}
