@@ -190,7 +190,8 @@ impl Pacer {
         if now.duration_since(s.last_up).as_secs_f64() >= 1.0 && since_down >= 2.0 {
             s.last_up = now;
             Self::refill(&mut s, now);
-            let inc = s.step.max(s.rate * 0.03); // ~3%/s: a dip at 20 is back above 30 in ~15 s
+            // ~3%/s normally; ~8%/s while below the dip level, so a step down in a storm is undone in ~10 s
+            let inc = s.step.max(s.rate * if s.rate < s.hard_floor { 0.08 } else { 0.03 });
             s.rate = (s.rate + inc).min(cap).max(s.rate.min(cap));
         }
     }
@@ -203,7 +204,8 @@ impl Pacer {
     /// the crawl the storm ended on (which would otherwise be inherited by every following file).
     pub fn lift_to_dip_level(&self) {
         let mut s = self.st.lock().unwrap();
-        if s.rate < s.hard_floor {
+        let recent_flood = s.last_down.map_or(false, |d| d.elapsed().as_secs_f64() < 20.0);
+        if s.rate < s.hard_floor && !recent_flood {
             s.rate = s.hard_floor;
             s.target = s.target.max(s.hard_floor);
         }
@@ -256,10 +258,12 @@ impl Pacer {
         let mult = if s.storm >= 3 { 0.7 } else { 0.8 };
         // blip: stay above the soft floor. storm: may dip to the hard floor ("dip" band). Only a long
         // unbroken storm (the server really refuses this rate) is allowed all the way down.
-        let floor = if s.storm >= 8 {
-            // a long storm: lower than the dip band, but never to a crawl. The server answers a flood
-            // with a wait either way, so a rate just under the dip band still gets served at its speed.
-            (s.hard_floor * 0.75).min(level).max(s.floor)
+        let floor = if s.storm >= 6 {
+            // ~11 s of back-to-back floods (each one a 2 s wait): the server refuses even half the dip
+            // level right now. Holding the dip level would only trade every second of sending for a wait.
+            (s.hard_floor * 0.25).min(level).max(s.floor)
+        } else if s.storm >= 4 {
+            (s.hard_floor * 0.5).min(level).max(s.floor)
         } else if s.storm >= 3 {
             s.hard_floor.min(level).max(s.floor)
         } else {
@@ -273,7 +277,9 @@ impl Pacer {
         let hold = (level * 0.93).max(s.rate);
         s.target = if s.storm >= 2 { s.rate } else { hold };
         s.hold_level = hold;
-        s.hold_until = Some(now + Duration::from_secs(45));
+        // after a lone flood the limit is probably stable: stay just under it for a while. After a storm it
+        // was a temporary refusal, so look again soon instead of sitting at the bottom for 45 s.
+        s.hold_until = Some(now + Duration::from_secs(if s.storm >= 3 || s.rate < s.hard_floor { 10 } else { 45 }));
         if std::env::var_os("CBCRYPTO_DEBUG_PACER").is_some() {
             eprintln!("[pacer] flood: level {:.1} rate {:.1} -> hold {:.1} storm {} floor {:.1}", level, s.rate, hold, s.storm, s.soft_floor);
         }
@@ -302,30 +308,46 @@ mod sim {
     /// Drive the pacer for `secs` seconds in 50 ms ticks, sending at the pacer's current rate.
     /// `flood_at(t, sending_rate)` says whether the server refuses at that moment.
     /// Returns (configured rate per second, floods).
-    fn run_cfg(cfg: PacerCfg, secs: usize, mut flood_at: impl FnMut(f64, f64) -> bool) -> (Vec<f64>, usize) {
+    fn run_cfg(cfg: PacerCfg, secs: usize, flood_at: impl FnMut(f64, f64) -> bool) -> (Vec<f64>, usize) {
+        let (t, f, _) = run_cfg_eff(cfg, secs, 0.0, flood_at);
+        (t, f)
+    }
+
+    /// Like `run_cfg`, but every flood also freezes sending for `pause` seconds (as the real engine
+    /// does) and the third value is the throughput per second that actually got through.
+    fn run_cfg_eff(cfg: PacerCfg, secs: usize, pause: f64, mut flood_at: impl FnMut(f64, f64) -> bool) -> (Vec<f64>, usize, Vec<f64>) {
         let t0 = Instant::now();
         let p = Pacer::new_at(&cfg, t0);
         let (mut trace, mut floods, mut last_flood, mut carry) = (Vec::new(), 0, -10.0f64, 0.0f64);
+        let (mut eff, mut sent_this_s) = (Vec::new(), 0.0f64);
+        let mut paused_until = -1.0f64;
         for tick in 0..secs * 20 {
             let t = tick as f64 * 0.05;
             let now = t0 + Duration::from_secs_f64(t);
             let rate = p.rate();
-            carry += rate * 0.05;
-            let n = carry.floor();
-            carry -= n;
-            p.record_grants_at(now, n as usize);
-            if flood_at(t, rate) && t - last_flood >= 1.0 {
-                p.on_flood_at(now);
-                floods += 1;
-                last_flood = t;
-            } else {
-                p.on_success_at(now);
+            if t >= paused_until {
+                carry += rate * 0.05;
+                let n = carry.floor();
+                carry -= n;
+                sent_this_s += n;
+                p.record_grants_at(now, n as usize);
+                if flood_at(t, rate) && t - last_flood >= 1.0 {
+                    p.on_flood_at(now);
+                    floods += 1;
+                    last_flood = t;
+                    paused_until = t + pause;
+                    sent_this_s -= n; // that burst was refused
+                } else {
+                    p.on_success_at(now);
+                }
             }
-            if tick % 20 == 0 {
+            if tick % 20 == 19 {
                 trace.push(p.rate());
+                eff.push(sent_this_s);
+                sent_this_s = 0.0;
             }
         }
-        (trace, floods)
+        (trace, floods, eff)
     }
 
     fn run(secs: usize, flood_at: impl FnMut(f64, f64) -> bool) -> (Vec<f64>, usize) {
@@ -391,11 +413,12 @@ mod sim {
     /// Floods one after another (server clearly saturated) must back off hard, not drift.
     #[test]
     fn storm_backs_off_hard() {
-        let (tr, floods) = run(40, |t, _| t >= 5.0 && t < 12.0);
+        let (tr, floods) = run(60, |t, _| t >= 5.0 && t < 12.0);
         println!("\n[E] flood storm 5-12 s: rate each second {:?}", tr.iter().map(|r| r.round() as i64).collect::<Vec<_>>());
         assert!(floods >= 3);
         assert!(min(&tr[8..16]) < 30.0, "a real storm must be allowed below the soft floor");
-        assert!(min(&tr[8..25]) >= 19.0, "but a short storm dips to the 20-30 band, not to a crawl: {}", min(&tr[8..25]));
+        assert!(min(&tr[8..40]) >= 9.0, "but a 7 s storm dips to ~10-15, not to a crawl: {}", min(&tr[8..40]));
+        assert!(tr[45] >= 30.0, "and is back above 30 within ~30 s of the storm ending: {}", tr[45]);
     }
 
     /// A slower server limit than the floor (15/s): must still be respected eventually.
@@ -404,7 +427,7 @@ mod sim {
         let (tr, floods) = run(120, |_, r| r > 15.0);
         println!("\n[F] server limit 15/s: rate each 10 s {:?} floods {}", trace10(&tr), floods);
         assert!(avg(&tr[60..]) <= 16.5 && avg(&tr[60..]) >= 12.0);
-        assert!(floods <= 40);
+        assert!(floods <= 60);
     }
         
     /// A flood wait must hold every connection, not only the one that received it, and must not
@@ -478,10 +501,27 @@ mod sim {
         }
         let end = p.rate();
         println!("\n[J] 46 flood events in 60 s: pace {:.1} req/s ({:.1} MiB/s)", end, end / 2.0);
-        assert!(end >= 30.0, "must stay at or above 15 MiB/s (30 req/s), got {end}");
-        let q = Pacer::new_at(&PacerCfg { hard_floor: 40.0, ..cfg }, base);
-        q.on_flood_at(base);
-        q.lift_to_dip_level();
-        assert!(q.rate() >= 40.0 || q.rate() >= 30.0, "starts the next file from the dip level, got {}", q.rate());
+        assert!(end >= 10.0, "a long storm may step down, but never to a crawl (5 MiB/s = 10 req/s), got {end}");
+        // a flood in the last seconds: the next file keeps the lowered rate instead of hitting the same wall
+        let before = p.rate();
+        p.lift_to_dip_level();
+        assert!((p.rate() - before).abs() < 1e-9, "no forced jump right after a flood");
     }
-                                 }
+
+    /// Production log: a bot refused 25 floods in a row (2 s waits) at the 20 MiB/s floor, which moved
+    /// ~2.5 MB/s. The server's limit was well below 20 for that minute. Step down, keep moving, and be
+    /// back at 20+ within ~25 s once it lets go.
+    #[test]
+    fn a_long_refusal_steps_down_and_recovers_fast() {
+        let (tr, floods, eff) = run_cfg_eff(upload_cfg(), 120, 2.0, |t, rate| {
+            if t < 50.0 { rate > 8.0 } else { rate > 40.0 }
+        });
+        println!("\n[K] server refuses >8/s for 50 s, then lets go: rate each 5 s {:?}  floods {}",
+            tr.iter().step_by(5).map(|r| r.round() as i64).collect::<Vec<_>>(), floods);
+        println!("    throughput that got through, each 5 s: {:?}", eff.iter().step_by(5).map(|r| r.round() as i64).collect::<Vec<_>>());
+        assert!(min(&tr) >= 5.0 - 1e-9, "never below 5/s: {}", min(&tr));
+        println!("    average that got through 15-50 s: {:.1}/s of an 8/s limit", avg(&eff[15..50]));
+        assert!(avg(&eff[15..50]) >= 3.0, "keeps moving during the refusal (a fixed 20 floor moves ~1): {:.1}", avg(&eff[15..50]));
+        assert!(tr[85] >= 20.0, "35 s after it lets go it is back above 20: {}", tr[85]);
+    }
+        }
