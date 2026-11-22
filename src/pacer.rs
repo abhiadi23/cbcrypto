@@ -417,4 +417,32 @@ mod sim {
         println!("\n[G] storm 5-9 s then calm: {:?}", tr.iter().map(|r| r.round() as i64).collect::<Vec<_>>());
         assert!(tr[25] >= 30.0, "25 s after the storm it is back in the band: {}", tr[25]);
     }
-            }
+
+    /// Upload defaults of cbgram: start at 28/s with no exponential overshoot, climb ~3%/s while calm.
+    fn upload_cfg() -> PacerCfg {
+        PacerCfg { rate: 28.0, burst: 4.0, ceiling: 60.0, step: 0.5, growth: 1.1, slow_start_cap: 28.0, hard_floor: 20.0 }
+    }
+
+    /// Where the server accepts more than the start: begin at 28 and climb towards the top, never flooding.
+    #[test]
+    fn upload_start_climbs_when_the_server_allows_it() {
+        let (tr, floods) = run_cfg(upload_cfg(), 60, |_, _| false);
+        println!("\n[H] upload start, no limit: rate each 10 s {:?}", trace10(&tr));
+        assert_eq!(floods, 0);
+        assert!(tr[1] >= 28.0 && tr[1] <= 31.0, "starts at ~28, not at the top: {}", tr[1]);
+        assert!(tr[20] >= 45.0, "20 s of calm lifts it into the 45+ band: {}", tr[20]);
+        assert!(max(&tr) <= 60.0 + 1e-9);
+    }
+
+    /// Where this bot is limited to ~26/s: no flood at all at the start, then a gentle sawtooth around
+    /// the limit, never the 3-4 floods per file and the cut to 20 seen with a start of 45.
+    #[test]
+    fn upload_start_below_the_limit_floods_rarely() {
+        let (tr, floods) = run_cfg(upload_cfg(), 120, |_, rate| rate > 26.0);
+        println!("\n[I] upload start, server limit 26/s: rate each 10 s {:?}  floods {}", trace10(&tr), floods);
+        assert!(tr[..5].iter().all(|r| *r <= 28.5), "no early overshoot");
+        assert!(avg(&tr[1..]) >= 24.0, "average {:.1}", avg(&tr[1..]));
+        assert!(min(&tr[1..]) >= 20.0, "never below 20: {}", min(&tr[1..]));
+        assert!(floods <= 12, "{floods} floods in 120 s");
+    }
+                }
