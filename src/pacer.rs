@@ -51,6 +51,8 @@ struct PacerSt {
     sustain_max: f64,
     credit_last: Instant,
     last_sustain_up: Instant,
+    /// until when the last flood's pause runs; a refusal of a request sent before this is that same flood
+    flood_covers_until: Option<Instant>,
 }
 
 pub struct PacerCfg {
@@ -104,6 +106,7 @@ impl Pacer {
                 sustain_max: c.ceiling.max(c.sustain),
                 credit_last: now,
                 last_sustain_up: now,
+                flood_covers_until: None,
             }),
         }
     }
@@ -271,6 +274,13 @@ impl Pacer {
     /// in-flight requests that answer with the same flood while that pause is already running.
     pub fn on_flood_wait(&self, secs: f64) -> bool {
         let now = Instant::now();
+        {
+            let mut s = self.st.lock().unwrap();
+            let until = now + Duration::from_secs_f64(secs.max(0.0).min(60.0));
+            if s.flood_covers_until.map_or(true, |t| until > t) {
+                s.flood_covers_until = Some(until);
+            }
+        }
         self.on_flood_at(now);
         let until = now + Duration::from_secs_f64(secs.max(0.0).min(60.0));
         let mut s = self.st.lock().unwrap();
@@ -279,6 +289,31 @@ impl Pacer {
             s.pause_until = Some(until);
         }
         fresh
+    }
+
+    /// `on_flood_wait` for a reply whose request was sent at `sent`. When the server refuses a burst, every
+    /// request that was already in the pipe answers with its own FLOOD_WAIT, and those answers are read
+    /// one by one, often after the pause has begun or even ended. Taking each for a new flood cut the rate
+    /// again and again (168 -> 5 requests/s after a single refusal) and extended the pause. A reply to a
+    /// request sent before that flood's pause ended carries no news: ignore it.
+    pub fn on_flood_wait_for(&self, secs: f64, sent: Option<Instant>) -> bool {
+        {
+            let mut s = self.st.lock().unwrap();
+            if let (Some(sent), Some(cover)) = (sent, s.flood_covers_until) {
+                if sent <= cover {
+                    // same flood. Never cut or count it again, but if it asks for a longer wait than
+                    // the pause now running, honour that
+                    let now = Instant::now();
+                    let until = now + Duration::from_secs_f64(secs.max(0.0).min(60.0));
+                    if s.pause_until.map_or(false, |t| now < t && until > t) {
+                        s.pause_until = Some(until);
+                        s.flood_covers_until = Some(until);
+                    }
+                    return false;
+                }
+            }
+        }
+        self.on_flood_wait(secs)
     }
 
     /// current request rate (requests/s)
