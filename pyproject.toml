@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "cbcrypto"
-version = "0.5.0"
+version = "0.5.1"
 description = "Rust core for cbgram: MTProto crypto and the file download/upload engine"
 readme = "Readme.md"
 requires-python = ">=3.8"
