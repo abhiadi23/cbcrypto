@@ -217,7 +217,7 @@ pub struct ConnCfg {
 enum Event<'a> {
     File { req: i64, data: &'a [u8] },
     Bool { req: i64, ok: bool },
-    RpcError { req: i64, code: i32, message: String },
+    RpcError { req: i64, code: i32, message: String, sent: Option<Instant> },
     Cdn,
     BadSalt { bad_msg_id: i64 },
     BadMsg { bad_msg_id: i64, code: i32 },
@@ -241,6 +241,9 @@ struct Conn {
     inited: bool,
     init_prefix: Vec<u8>,
     rbuf: Vec<u8>,
+    /// when each request still waiting for an answer was sent, so a flood reply can be told apart:
+    /// an answer to a request sent before the pause we already reacted to is the same flood again
+    sent: HashMap<i64, Instant>,
 }
 
 fn rand_fill(b: &mut [u8]) -> Res<()> {
@@ -310,6 +313,7 @@ impl Conn {
             inited: false,
             init_prefix: cfg.init_prefix.clone(),
             rbuf: Vec::new(),
+            sent: HashMap::new(),
         })
     }
 
@@ -358,6 +362,12 @@ impl Conn {
 
     fn send_body(&mut self, body: &[u8], content: bool) -> Res<i64> {
         let msg_id = self.new_msg_id();
+        if content {
+            if self.sent.len() > 8192 {
+                self.sent.clear(); // answers that never came (bad salt, resent): do not grow without bound
+            }
+            self.sent.insert(msg_id, Instant::now());
+        }
         let seq_no = if content {
             let v = self.seq * 2 + 1;
             self.seq += 1;
@@ -494,12 +504,13 @@ impl Conn {
         F: FnMut(Event<'_>) -> Res<()>,
     {
         let bad = || EngineError::Protocol("truncated result".into());
+        let sent = self.sent.remove(&req);
         match rd_u32(res, 0).ok_or_else(bad)? {
             RPC_ERROR => {
                 let code = rd_i32(res, 4).ok_or_else(bad)?;
                 let (s, l, _) = tl_bytes_at(res, 8).ok_or_else(bad)?;
                 let message = String::from_utf8_lossy(&res[s..s + l]).into_owned();
-                f(Event::RpcError { req, code, message })
+                f(Event::RpcError { req, code, message, sent })
             }
             UPLOAD_FILE => {
                 // ctor, storage.FileType ctor, mtime:int, bytes
@@ -540,6 +551,93 @@ impl Conn {
         self.last_ack = Instant::now();
         self.send_body(&body, false)?;
         Ok(())
+    }
+}
+
+
+// ------------------------------------------------------------------ warm connection pool
+
+/// Connections kept open between transfers. A new file used to open every connection from scratch
+/// (TCP handshake, a cold congestion window, initConnection) and only then reach full speed, which
+/// is why short files never got there and big ones started slowly. A connection that finished its
+/// share cleanly is parked here for a short time and handed to the next transfer on the same
+/// endpoint and account. Off with CBCRYPTO_POOL=0.
+type PoolKey = (String, u16, Vec<u8>);
+const POOL_MAX_PER_KEY: usize = 24;
+
+fn pool_enabled() -> bool {
+    std::env::var("CBCRYPTO_POOL").map_or(true, |v| v != "0")
+}
+
+fn pool_ttl() -> Duration {
+    Duration::from_secs(
+        std::env::var("CBCRYPTO_POOL_TTL").ok().and_then(|v| v.parse().ok()).unwrap_or(45),
+    )
+}
+
+fn pool_reg() -> &'static Mutex<HashMap<PoolKey, Vec<(Conn, Instant)>>> {
+    static REG: OnceLock<Mutex<HashMap<PoolKey, Vec<(Conn, Instant)>>>> = OnceLock::new();
+    REG.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn pool_key(c: &ConnCfg) -> PoolKey {
+    (c.host.clone(), c.port, c.auth_key_id.clone())
+}
+
+/// False if the peer closed the socket or it errored while idle.
+fn conn_alive(c: &Conn) -> bool {
+    if c.s.set_nonblocking(true).is_err() {
+        return false;
+    }
+    let mut b = [0u8; 1];
+    let r = c.s.peek(&mut b);
+    let _ = c.s.set_nonblocking(false);
+    match r {
+        Ok(0) => false,
+        Ok(_) => true,
+        Err(e) => e.kind() == std::io::ErrorKind::WouldBlock,
+    }
+}
+
+fn pool_put(cfg: &ConnCfg, c: Conn) {
+    if !pool_enabled() {
+        return;
+    }
+    let ttl = pool_ttl();
+    let now = Instant::now();
+    let mut reg = pool_reg().lock().unwrap();
+    reg.retain(|_, v| {
+        v.retain(|(_, t)| now.duration_since(*t) < ttl);
+        !v.is_empty()
+    });
+    let mut c = c;
+    c.sent.clear();
+    let slot = reg.entry(pool_key(cfg)).or_default();
+    if slot.len() < POOL_MAX_PER_KEY {
+        slot.push((c, now));
+    }
+}
+
+fn pool_take(cfg: &ConnCfg) -> Option<Conn> {
+    if !pool_enabled() {
+        return None;
+    }
+    let ttl = pool_ttl();
+    loop {
+        let c = {
+            let mut reg = pool_reg().lock().unwrap();
+            let slot = reg.get_mut(&pool_key(cfg))?;
+            let (c, t) = slot.pop()?;
+            if slot.is_empty() {
+                reg.remove(&pool_key(cfg));
+            }
+            (c, t)
+        };
+        if c.1.elapsed() < ttl && conn_alive(&c.0) {
+            let _ = c.0.s.set_read_timeout(Some(cfg.read_timeout));
+            return Some(c.0);
+        }
+        // expired or closed by the peer: drop it and try the next one
     }
 }
 
@@ -769,26 +867,35 @@ fn run_session(sh: &Shared, cfg: &TransferCfg, c: &mut Conn, inflight: &mut Hash
                         }
                     }
                 }
-                Event::RpcError { req, code, message } => {
+                Event::RpcError { req, code, message, sent } => {
                     if let Some(idx) = inflight.remove(&req) {
                         if let Some(secs) = parse_flood(&message) {
-                            let mut slept = sh.flood_slept.lock().unwrap();
-                            if secs > sh.flood_each_cap || *slept + secs > sh.flood_total_cap {
+                            if secs > sh.flood_each_cap {
                                 fatal = Some(EngineError::Rpc { code, message });
                             } else {
-                                *slept += secs;
-                                sh.floods.fetch_add(1, Ordering::Relaxed);
-                                sh.flood_ms.fetch_add((secs * 1000.0) as u64, Ordering::Relaxed);
-                                sh.flood_max_ms.fetch_max((secs * 1000.0) as u64, Ordering::Relaxed);
-                                // one log line per flood (not one per in-flight request that answers with it)
+                                // One flood is answered by every request that was in flight; only the first
+                                // reply starts the shared pause. Count and report the flood once, and charge
+                                // the total budget what was really waited, not once per answering request.
                                 let fresh = match &sh.pacer {
-                                    Some(p) => p.on_flood_wait(secs),
+                                    Some(p) => p.on_flood_wait_for(secs, sent),
                                     None => true,
                                 };
-                                if fresh {
-                                    sh.flood_events.lock().unwrap().push(secs);
+                                let mut slept = sh.flood_slept.lock().unwrap();
+                                if fresh && *slept + secs > sh.flood_total_cap {
+                                    fatal = Some(EngineError::Rpc { code, message });
+                                } else {
+                                    if fresh {
+                                        *slept += secs;
+                                        sh.flood_events.lock().unwrap().push(secs);
+                                    }
+                                    sh.floods.fetch_add(1, Ordering::Relaxed);
+                                    sh.flood_ms.fetch_add((secs * 1000.0) as u64, Ordering::Relaxed);
+                                    sh.flood_max_ms.fetch_max((secs * 1000.0) as u64, Ordering::Relaxed);
+                                    // With a pacer the pause already holds every connection (acquire waits for
+                                    // it), so a per-request sleep on top only stacked waits: four refused
+                                    // requests on one connection slept four times as long.
+                                    acts.push(Act(idx, if sh.pacer.is_some() { 0.0 } else { secs }));
                                 }
-                                acts.push(Act(idx, secs));
                             }
                         } else if (500..600).contains(&code) && sh.server_errs.fetch_add(1, Ordering::Relaxed) < 20 {
                             acts.push(Act(idx, 1.0)); // INTERNAL & friends: transient, retry
@@ -865,12 +972,20 @@ fn worker(sh: Arc<Shared>, cfg: TransferCfg) {
     let mut conn: Option<Conn> = None;
     let mut inflight: HashMap<i64, usize> = HashMap::new();
     let mut failures = 0u32;
+    let mut clean = false;
     loop {
         if sh.cancel.load(Ordering::Relaxed) {
             break;
         }
         if conn.is_none() {
-            match Conn::connect(&cfg.conn) {
+            // first connection of this worker: reuse a warm one if there is one. After an error the
+            // worker always dials a fresh connection (the pool may hold ones from the same bad path).
+            let warm = if failures == 0 { pool_take(&cfg.conn) } else { None };
+            let attempt = match warm {
+                Some(c) => Ok(c),
+                None => Conn::connect(&cfg.conn),
+            };
+            match attempt {
                 Ok(c) => conn = Some(c),
                 Err(e) => {
                     failures += 1;
@@ -888,7 +1003,7 @@ fn worker(sh: Arc<Shared>, cfg: TransferCfg) {
         let c = conn.as_mut().unwrap();
         match run_session(&sh, &cfg, c, &mut inflight) {
             Ok(()) => {
-                let _ = c.flush_acks(true);
+                clean = c.flush_acks(true).is_ok();
                 break;
             }
             Err(EngineError::Cancelled) => {
@@ -919,6 +1034,11 @@ fn worker(sh: Arc<Shared>, cfg: TransferCfg) {
                 sh.fail(e);
                 break;
             }
+        }
+    }
+    if clean && inflight.is_empty() && !sh.cancel.load(Ordering::Relaxed) {
+        if let Some(c) = conn.take() {
+            pool_put(&cfg.conn, c);
         }
     }
     dbg_log!("worker exit (completed {}/{})", sh.completed.load(Ordering::SeqCst), sh.remaining);
@@ -1289,3 +1409,342 @@ mod tcp_cc_tests {
         } // else: a kernel without bbr must simply fail quietly, which is what connect() relies on
     }
 }
+
+#[cfg(test)]
+mod pool_tests {
+    use super::*;
+    use std::net::TcpListener;
+
+    fn cfg_for(port: u16, key: u8) -> ConnCfg {
+        ConnCfg {
+            host: "127.0.0.1".into(),
+            port,
+            auth_key: vec![key; 256],
+            auth_key_id: vec![key; 8],
+            salt: 0,
+            init_prefix: Vec::new(),
+            time_offset: 0.0,
+            recv_buf: 0,
+            read_timeout: Duration::from_secs(5),
+        }
+    }
+
+    /// A listener that accepts and keeps every connection open, reading the 64 init bytes.
+    fn quiet_server() -> (u16, std::sync::mpsc::Receiver<TcpStream>) {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for s in l.incoming().flatten() {
+                let mut s2 = s.try_clone().unwrap();
+                let mut b = [0u8; 64];
+                let _ = s2.read_exact(&mut b);
+                let _ = tx.send(s);
+            }
+        });
+        (port, rx)
+    }
+
+    #[test]
+    fn a_parked_connection_is_handed_to_the_next_transfer() {
+        let (port, _rx) = quiet_server();
+        let cfg = cfg_for(port, 11);
+        let c = Conn::connect(&cfg).unwrap();
+        let local = c.s.local_addr().unwrap();
+        pool_put(&cfg, c);
+        let again = pool_take(&cfg).expect("a warm connection should be available");
+        assert_eq!(again.s.local_addr().unwrap(), local, "must be the same socket, not a new one");
+        assert!(pool_take(&cfg).is_none(), "a connection is handed out once");
+    }
+
+    #[test]
+    fn another_account_never_gets_it() {
+        let (port, _rx) = quiet_server();
+        let cfg = cfg_for(port, 12);
+        pool_put(&cfg, Conn::connect(&cfg).unwrap());
+        assert!(pool_take(&cfg_for(port, 13)).is_none());
+        assert!(pool_take(&cfg).is_some());
+    }
+
+    #[test]
+    fn a_connection_closed_by_the_peer_is_not_reused() {
+        let (port, rx) = quiet_server();
+        let cfg = cfg_for(port, 14);
+        pool_put(&cfg, Conn::connect(&cfg).unwrap());
+        let server_side = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        drop(server_side);
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(pool_take(&cfg).is_none(), "a dead socket must be skipped, not handed out");
+    }
+}
+
+#[cfg(test)]
+mod e2e_tests {
+    //! Whole-transfer tests against a fake Telegram: real sockets, real MTProto framing and crypto, a
+    //! server that enforces a requests/s limit and answers over-limit requests with FLOOD_WAIT_1.
+    use super::*;
+    use sha2::{Digest, Sha256};
+    use std::collections::HashSet;
+    use std::net::TcpListener;
+    use std::sync::atomic::AtomicUsize as AU;
+
+    pub struct Srv {
+        pub limit: usize,
+        pub accepted: AU,
+        pub parts: Mutex<HashSet<i32>>,
+        pub flood_replies: AU,
+        window: Mutex<VecDeque<Instant>>,
+        penalty: Mutex<Option<Instant>>,
+    }
+
+    fn tl_str(b: &mut Vec<u8>, s: &str) {
+        b.push(s.len() as u8);
+        b.extend_from_slice(s.as_bytes());
+        while b.len() % 4 != 0 {
+            b.push(0);
+        }
+    }
+
+    fn srv_send(s: &mut TcpStream, tx: &mut CtrSt, auth_key: &[u8], session_id: &[u8], msg_id: i64, body: &[u8]) {
+        let plain_len = 32 + body.len();
+        let pad = (16 - (plain_len + 12) % 16) % 16 + 12;
+        let total = 24 + plain_len + pad;
+        let mut buf = vec![0u8; total];
+        let (head, plain) = buf.split_at_mut(24);
+        head[..8].copy_from_slice(&auth_key[..8]); // test auth_key_id == first 8 bytes of the key
+        plain[8..16].copy_from_slice(session_id);
+        plain[16..24].copy_from_slice(&msg_id.to_le_bytes());
+        plain[24..28].copy_from_slice(&1i32.to_le_bytes()); // content-related: the client acks it
+        plain[28..32].copy_from_slice(&(body.len() as u32).to_le_bytes());
+        plain[32..plain_len].copy_from_slice(body);
+        let h = Sha256::new().chain_update(&auth_key[96..128]).chain_update(&*plain).finalize();
+        head[8..24].copy_from_slice(&h[8..24]);
+        let (k, iv) = crate::kdf_raw(auth_key, &head[8..24], false);
+        crate::ige_enc_inplace_any(&k, &iv, plain);
+        let words = total / 4;
+        let mut out = Vec::with_capacity(4 + total);
+        if words <= 126 {
+            out.push(words as u8);
+        } else {
+            out.push(0x7f);
+            out.extend_from_slice(&(words as u32).to_le_bytes()[..3]);
+        }
+        out.extend_from_slice(&buf);
+        tx.apply(&mut out);
+        let _ = s.write_all(&out);
+    }
+
+    fn serve(mut s: TcpStream, auth_key: Vec<u8>, st: Arc<Srv>) {
+        let mut init = [0u8; 64];
+        if s.read_exact(&mut init).is_err() {
+            return;
+        }
+        st.accepted.fetch_add(1, Ordering::SeqCst);
+        let rev: Vec<u8> = init[8..56].iter().rev().copied().collect();
+        let mut rx = CtrSt { key: init[8..40].try_into().unwrap(), iv: init[40..56].try_into().unwrap(), st: 0 };
+        let mut skip = init;
+        rx.apply(&mut skip);
+        let mut tx = CtrSt { key: rev[0..32].try_into().unwrap(), iv: rev[32..48].try_into().unwrap(), st: 0 };
+        let mut counter = 0i64;
+        loop {
+            let mut b = [0u8; 1];
+            if s.read_exact(&mut b).is_err() {
+                return;
+            }
+            rx.apply(&mut b);
+            let mut words = b[0] as usize;
+            if b[0] == 0x7f {
+                let mut l = [0u8; 3];
+                if s.read_exact(&mut l).is_err() {
+                    return;
+                }
+                rx.apply(&mut l);
+                words = l[0] as usize | (l[1] as usize) << 8 | (l[2] as usize) << 16;
+            }
+            let mut pkt = vec![0u8; words * 4];
+            if s.read_exact(&mut pkt).is_err() {
+                return;
+            }
+            rx.apply(&mut pkt);
+            let (k, iv) = crate::kdf_raw(&auth_key, &pkt[8..24], true);
+            let mut plain = vec![0u8; pkt.len() - 24];
+            crate::ige_dec_any(&k, &iv, &pkt[24..], &mut plain);
+            let session_id: [u8; 8] = plain[8..16].try_into().unwrap();
+            let msg_id = i64::from_le_bytes(plain[16..24].try_into().unwrap());
+            let len = u32::from_le_bytes(plain[28..32].try_into().unwrap()) as usize;
+            let body = &plain[32..32 + len];
+            if body.len() < 20 || u32::from_le_bytes(body[0..4].try_into().unwrap()) != SAVE_BIG_FILE_PART {
+                continue; // an ack
+            }
+            let part = i32::from_le_bytes(body[12..16].try_into().unwrap());
+            let now = Instant::now();
+            let flood = {
+
+                let mut pen = st.penalty.lock().unwrap();
+                let mut w = st.window.lock().unwrap();
+                while w.front().map_or(false, |t| now.duration_since(*t) > Duration::from_secs(1)) {
+                    w.pop_front();
+                }
+                if pen.map_or(false, |t| now < t) {
+                    true
+                } else if w.len() >= st.limit {
+                    *pen = Some(now + Duration::from_secs(1));
+                    true
+                } else {
+                    w.push_back(now);
+                    false
+                }
+            };
+            let mut reply = Vec::new();
+            reply.extend_from_slice(&RPC_RESULT.to_le_bytes());
+            reply.extend_from_slice(&msg_id.to_le_bytes());
+            if flood {
+                st.flood_replies.fetch_add(1, Ordering::SeqCst);
+                reply.extend_from_slice(&RPC_ERROR.to_le_bytes());
+                reply.extend_from_slice(&420i32.to_le_bytes());
+                tl_str(&mut reply, "FLOOD_WAIT_1");
+            } else {
+                st.parts.lock().unwrap().insert(part);
+                reply.extend_from_slice(&BOOL_TRUE.to_le_bytes());
+            }
+            counter += 1;
+            srv_send(&mut s, &mut tx, &auth_key, &session_id, 0x6000_0000_0000_0000 + counter * 4 + 1, &reply);
+        }
+    }
+
+    pub fn start_server(key: u8, limit: usize) -> (u16, Arc<Srv>, Vec<u8>) {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let mut auth_key = vec![key; 256];
+        for (i, b) in auth_key.iter_mut().enumerate() {
+            *b = key.wrapping_add(i as u8).wrapping_mul(7).wrapping_add(3);
+        }
+        let st = Arc::new(Srv {
+            limit,
+            accepted: AU::new(0),
+            parts: Mutex::new(HashSet::new()),
+            flood_replies: AU::new(0),
+            window: Mutex::new(VecDeque::new()),
+            penalty: Mutex::new(None),
+        });
+        let (st2, ak) = (st.clone(), auth_key.clone());
+        std::thread::spawn(move || {
+            for s in l.incoming().flatten() {
+                let (st3, ak3) = (st2.clone(), ak.clone());
+                std::thread::spawn(move || serve(s, ak3, st3));
+            }
+        });
+        (port, st, auth_key)
+    }
+
+    pub struct Out {
+        pub sh: Arc<Shared>,
+        pub secs: f64,
+    }
+
+    /// Upload `parts` parts of `unit` bytes with `conns` workers and the given pacer settings.
+    pub fn upload(port: u16, auth_key: &[u8], parts: usize, unit: u64, conns: usize, rate: f64, ceiling: f64) -> Out {
+        let size = parts as u64 * unit;
+        let path = std::env::temp_dir().join(format!("cbcrypto-e2e-{}-{}-{}", port, parts, std::process::id()));
+        std::fs::write(&path, vec![7u8; size as usize]).unwrap();
+        let file = File::open(&path).unwrap();
+        let conn = ConnCfg {
+            host: "127.0.0.1".into(),
+            port,
+            auth_key: auth_key.to_vec(),
+            auth_key_id: auth_key[..8].to_vec(),
+            salt: 0,
+            init_prefix: Vec::new(),
+            time_offset: 0.0,
+            recv_buf: 0,
+            read_timeout: Duration::from_secs(10),
+        };
+        let cfg = TransferCfg {
+            conn,
+            mode: Mode::Upload,
+            inflight: 4,
+            max_reconnects: 5,
+            req_prefix: Vec::new(),
+            file_id: 42,
+            is_big: true,
+            total_parts: parts as i32,
+        };
+        let pc = PacerCfg { rate, burst: 8.0, ceiling, step: 1.0, growth: 1.1, slow_start_cap: rate, hard_floor: 20.0, burst_credit: 0.0, sustain: 0.0 };
+        let sh = Arc::new(Shared {
+            cancel: AtomicBool::new(false),
+            err: Mutex::new(None),
+            done_bytes: AtomicU64::new(0),
+            active: AtomicUsize::new(conns),
+            next: AtomicUsize::new(0),
+            total: parts,
+            retry: Mutex::new(VecDeque::new()),
+            pacer: Some(make_pacer(&cfg, &pc)),
+            flood_slept: Mutex::new(0.0),
+            flood_events: Mutex::new(Vec::new()),
+            floods: AtomicU64::new(0),
+            flood_ms: AtomicU64::new(0),
+            flood_max_ms: AtomicU64::new(0),
+            reconnects: AtomicU64::new(0),
+            timeouts: AtomicU64::new(0),
+            server_errs: AtomicUsize::new(0),
+            completed: AtomicUsize::new(0),
+            remaining: parts,
+            last_progress: Mutex::new(Instant::now()),
+            stall_limit: Duration::from_secs(60),
+            flood_total_cap: 300.0,
+            flood_each_cap: 30.0,
+            file,
+            size,
+            unit,
+            start: 0,
+        });
+        let t0 = Instant::now();
+        let hs: Vec<_> = (0..conns)
+            .map(|_| {
+                let (s, c) = (sh.clone(), cfg.clone());
+                std::thread::spawn(move || worker(s, c))
+            })
+            .collect();
+        for h in hs {
+            h.join().unwrap();
+        }
+        let _ = std::fs::remove_file(path);
+        Out { sh, secs: t0.elapsed().as_secs_f64() }
+    }
+
+    pub fn failed(o: &Out) -> Option<String> {
+        o.sh.err.lock().unwrap().as_ref().map(|e| format!("{e:?}"))
+    }
+
+    /// A pacer that asks for twice what the server allows: many floods, and the transfer must still
+    /// deliver every part exactly once without being killed by the flood budget.
+    #[test]
+    fn a_flood_storm_does_not_kill_or_corrupt_the_transfer() {
+        let (port, srv, key) = start_server(1, 60);
+        let o = upload(port, &key, 900, 4096, 8, 150.0, 200.0);
+        let floods = srv.flood_replies.load(Ordering::SeqCst);
+        eprintln!("storm: {:.1}s, flood replies {}, logged floods {}, slept {:.0}s, err {:?}",
+            o.secs, floods, o.sh.flood_events.lock().unwrap().len(), *o.sh.flood_slept.lock().unwrap(), failed(&o));
+        assert!(failed(&o).is_none(), "transfer failed: {:?}", failed(&o));
+        assert_eq!(srv.parts.lock().unwrap().len(), 900, "every part must arrive");
+        assert!(floods > 0, "the test must actually flood");
+        // The server refuses only while the pacer is above its limit. Before the fix, replies to requests
+        // already in the pipe were each taken for a new flood: the rate fell to 5 req/s after a single
+        // refusal and the file took ~63 s instead of ~23 s.
+        assert!(o.secs < 40.0, "a flood storm must not collapse the rate: took {:.1}s", o.secs);
+    }
+
+    /// The next file reuses the connections the previous one finished with instead of dialling again.
+    #[test]
+    fn the_next_transfer_reuses_warm_connections() {
+        let (port, srv, key) = start_server(2, 100_000);
+        let a = upload(port, &key, 200, 4096, 8, 400.0, 600.0);
+        assert!(failed(&a).is_none());
+        let after_first = srv.accepted.load(Ordering::SeqCst);
+        assert_eq!(after_first, 8, "first transfer dials its 8 connections");
+        let b = upload(port, &key, 200, 4096, 8, 400.0, 600.0);
+        assert!(failed(&b).is_none());
+        assert_eq!(srv.accepted.load(Ordering::SeqCst), after_first, "second transfer must dial nothing new");
+        assert_eq!(srv.parts.lock().unwrap().len(), 200);
+    }
+    }
