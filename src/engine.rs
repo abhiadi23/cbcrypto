@@ -1084,8 +1084,8 @@ fn run_transfer(
     Ok(done)
 }
 
-fn pacer_cfg(paced: bool, rate: f64, burst: f64, ceiling: f64, step: f64, growth: f64, cap: f64, floor: f64) -> Option<PacerCfg> {
-    paced.then_some(PacerCfg { rate, burst, ceiling, step, growth, slow_start_cap: cap, hard_floor: floor })
+fn pacer_cfg(paced: bool, rate: f64, burst: f64, ceiling: f64, step: f64, growth: f64, cap: f64, floor: f64, burst_credit: f64, sustain: f64) -> Option<PacerCfg> {
+    paced.then_some(PacerCfg { rate, burst, ceiling, step, growth, slow_start_cap: cap, hard_floor: floor, burst_credit, sustain })
 }
 
 #[pyfunction]
@@ -1093,7 +1093,7 @@ fn pacer_cfg(paced: bool, rate: f64, burst: f64, ceiling: f64, step: f64, growth
                     start_offset=0, chunk_size=1048576, connections=5, inflight=3, paced=true,
                     rate=8.0, burst=8.0, ceiling=150.0, step=0.5, growth=1.5, slow_start_cap=40.0,
                     progress=None, time_offset=0.0, recv_buffer=0, read_timeout=30.0,
-                    flood_each_cap=30.0, flood_total_cap=300.0, max_reconnects=5, floor=1.0, stats=None, on_flood=None))]
+                    flood_each_cap=30.0, flood_total_cap=300.0, max_reconnects=5, floor=1.0, stats=None, on_flood=None, burst_credit=0.0, sustain=0.0))]
 #[allow(clippy::too_many_arguments)]
 fn download(
     py: Python<'_>,
@@ -1127,6 +1127,8 @@ fn download(
     floor: f64,
     stats: Option<Py<pyo3::types::PyDict>>,
     on_flood: Option<PyObject>,
+    burst_credit: f64,
+    sustain: f64,
 ) -> PyResult<u64> {
     check_common(&auth_key, &auth_key_id, chunk_size)?;
     if start_offset % chunk_size != 0 || start_offset >= file_size {
@@ -1149,7 +1151,7 @@ fn download(
     };
     run_transfer(
         py, cfg, file, file_size, chunk_size, start_offset, total, 0, connections,
-        pacer_cfg(paced, rate, burst, ceiling, step, growth, slow_start_cap, floor),
+        pacer_cfg(paced, rate, burst, ceiling, step, growth, slow_start_cap, floor, burst_credit, sustain),
         flood_each_cap, flood_total_cap, progress, stats, on_flood,
     )
 }
@@ -1159,7 +1161,7 @@ fn download(
                     part_size=524288, start_part=0, is_big=true, connections=5, inflight=3, paced=true,
                     rate=32.0, burst=16.0, ceiling=300.0, step=1.0, growth=1.5, slow_start_cap=80.0,
                     progress=None, time_offset=0.0, recv_buffer=0, read_timeout=30.0,
-                    flood_each_cap=30.0, flood_total_cap=300.0, max_reconnects=5, floor=1.0, stats=None, on_flood=None))]
+                    flood_each_cap=30.0, flood_total_cap=300.0, max_reconnects=5, floor=1.0, stats=None, on_flood=None, burst_credit=0.0, sustain=0.0))]
 #[allow(clippy::too_many_arguments)]
 fn upload(
     py: Python<'_>,
@@ -1194,6 +1196,8 @@ fn upload(
     floor: f64,
     stats: Option<Py<pyo3::types::PyDict>>,
     on_flood: Option<PyObject>,
+    burst_credit: f64,
+    sustain: f64,
 ) -> PyResult<u64> {
     check_common(&auth_key, &auth_key_id, part_size)?;
     let total_parts = file_size.div_ceil(part_size) as usize;
@@ -1216,7 +1220,7 @@ fn upload(
     };
     run_transfer(
         py, cfg, file, file_size, part_size, 0, total_parts, start_part, connections,
-        pacer_cfg(paced, rate, burst, ceiling, step, growth, slow_start_cap, floor),
+        pacer_cfg(paced, rate, burst, ceiling, step, growth, slow_start_cap, floor, burst_credit, sustain),
         flood_each_cap, flood_total_cap, progress, stats, on_flood,
     )
 }
@@ -1253,7 +1257,7 @@ mod shared_pacer_tests {
     use super::*;
 
     fn cfg() -> PacerCfg {
-        PacerCfg { rate: 45.0, burst: 8.0, ceiling: 60.0, step: 0.5, growth: 1.1, slow_start_cap: 60.0, hard_floor: 20.0 }
+        PacerCfg { rate: 45.0, burst: 8.0, ceiling: 60.0, step: 0.5, growth: 1.1, slow_start_cap: 60.0, hard_floor: 20.0, burst_credit: 0.0, sustain: 0.0 }
     }
 
     #[test]
