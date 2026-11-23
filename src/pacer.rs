@@ -40,6 +40,17 @@ struct PacerSt {
     /// is what the server judged, not the configured one
     grants: VecDeque<Instant>,
     born: Instant,
+    /// Burst credit (0 cap = off). Mirrors a server that lets a bot send fast until a bank of requests
+    /// is spent and then only at the sustained rate: `credit` refills at `sustain` requests/s up to
+    /// `credit_cap` and every request spends one. With the bank empty we send at `sustain`, so the
+    /// fast start is used on purpose and the drop to the sustained rate happens BEFORE the flood.
+    credit: f64,
+    credit_cap: f64,
+    sustain: f64,
+    sustain_min: f64,
+    sustain_max: f64,
+    credit_last: Instant,
+    last_sustain_up: Instant,
 }
 
 pub struct PacerCfg {
@@ -51,6 +62,9 @@ pub struct PacerCfg {
     pub slow_start_cap: f64,
     /// lowest rate a flood storm cuts to before it is judged a real server limit (requests/s)
     pub hard_floor: f64,
+    /// burst bank in requests (0 = off) and the sustained rate in requests/s it refills at
+    pub burst_credit: f64,
+    pub sustain: f64,
 }
 
 impl Pacer {
@@ -83,17 +97,48 @@ impl Pacer {
                 hold_until: None,
                 grants: VecDeque::new(),
                 born: now,
+                credit: c.burst_credit,
+                credit_cap: c.burst_credit,
+                sustain: c.sustain.max(1.0),
+                sustain_min: (c.hard_floor * 0.5).max(1.0),
+                sustain_max: c.ceiling.max(c.sustain),
+                credit_last: now,
+                last_sustain_up: now,
             }),
         }
     }
 
+    fn credit_tick(s: &mut PacerSt, now: Instant) {
+        if s.credit_cap <= 0.0 {
+            return;
+        }
+        let dt = now.saturating_duration_since(s.credit_last).as_secs_f64();
+        s.credit = (s.credit + s.sustain * dt).min(s.credit_cap);
+        s.credit_last = s.credit_last.max(now);
+    }
+
+    /// The rate requests are actually released at: the full pacer rate while there is burst credit,
+    /// the sustained rate once the bank is empty.
+    fn eff_rate(s: &PacerSt) -> f64 {
+        if s.credit_cap > 0.0 && s.credit < 1.0 {
+            s.rate.min(s.sustain)
+        } else {
+            s.rate
+        }
+    }
+
     fn refill(s: &mut PacerSt, now: Instant) {
+        Self::credit_tick(s, now);
         let el = now.duration_since(s.last_refill).as_secs_f64();
-        s.tokens = s.burst.min(s.tokens + el * s.rate);
+        s.tokens = s.burst.min(s.tokens + el * Self::eff_rate(s));
         s.last_refill = now;
     }
 
     fn note_grant(s: &mut PacerSt, now: Instant, n: usize) {
+        if s.credit_cap > 0.0 {
+            Self::credit_tick(s, now);
+            s.credit = (s.credit - n as f64).max(0.0);
+        }
         for _ in 0..n {
             s.grants.push_back(now);
         }
@@ -143,7 +188,7 @@ impl Pacer {
                     Self::note_grant(&mut s, Instant::now(), 1);
                     return true;
                 }
-                (1.0 - s.tokens) / s.rate.max(0.001)
+                (1.0 - s.tokens) / Self::eff_rate(&s).max(0.001)
             };
             std::thread::sleep(Duration::from_secs_f64(wait.min(0.05)));
         }
@@ -155,6 +200,13 @@ impl Pacer {
 
     pub fn on_success_at(&self, now: Instant) {
         let mut s = self.st.lock().unwrap();
+        if s.credit_cap > 0.0 && s.credit < 1.0 && s.sustain < s.sustain_max
+            && s.last_down.map_or(true, |d| now.duration_since(d).as_secs_f64() >= 30.0)
+            && now.duration_since(s.last_sustain_up).as_secs_f64() >= 1.0
+        {
+            s.last_sustain_up = now;
+            s.sustain = (s.sustain * 1.02).min(s.sustain_max);
+        }
         if s.slow_start {
             if now.duration_since(s.last_up).as_secs_f64() >= 0.25 {
                 s.last_up = now;
@@ -191,7 +243,8 @@ impl Pacer {
             s.last_up = now;
             Self::refill(&mut s, now);
             // ~3%/s normally; ~8%/s while below the dip level, so a step down in a storm is undone in ~10 s
-            let inc = s.step.max(s.rate * if s.rate < s.hard_floor { 0.08 } else { 0.03 });
+            let banked = s.credit_cap > 0.0 && s.credit > s.credit_cap * 0.25; // spending the burst bank: climb fast
+            let inc = s.step.max(s.rate * if s.rate < s.hard_floor || banked { 0.08 } else { 0.03 });
             s.rate = (s.rate + inc).min(cap).max(s.rate.min(cap));
         }
     }
@@ -234,10 +287,28 @@ impl Pacer {
         self.st.lock().unwrap().rate
     }
 
+    /// The rate currently released (differs from `rate` only when the burst bank is empty).
+    #[allow(dead_code)]
+    pub fn effective_rate(&self) -> f64 {
+        Self::eff_rate(&self.st.lock().unwrap())
+    }
+
     pub fn on_flood_at(&self, now: Instant) {
         let mut s = self.st.lock().unwrap();
         if s.last_down.map_or(false, |d| now.duration_since(d).as_secs_f64() < 1.0) {
             return;
+        }
+        if s.credit_cap > 0.0 {
+            Self::credit_tick(&mut s, now);
+            if s.credit > s.credit_cap * 0.25 {
+                // flooded while we still thought we had credit: the real bank is smaller than we assumed
+                s.credit_cap = (s.credit_cap * 0.75).max(20.0);
+            } else {
+                // flooded at the sustained rate: that rate is a bit too high for this bot right now
+                s.sustain = (s.sustain * 0.92).max(s.sustain_min);
+            }
+            s.credit = 0.0;
+            s.last_sustain_up = now;
         }
         // back-to-back floods mean the server really is at its limit: back off hard.
         // A flood after a calm spell was probably a blip: cut gently and climb back.
@@ -297,12 +368,12 @@ mod sim {
     /// The band used for bots and normal accounts (1 MiB chunks): start 45/s, never above 60/s,
     /// storms may dip to 20/s.
     fn band() -> PacerCfg {
-        PacerCfg { rate: 45.0, burst: 8.0, ceiling: 60.0, step: 0.5, growth: 1.1, slow_start_cap: 60.0, hard_floor: 20.0 }
+        PacerCfg { rate: 45.0, burst: 8.0, ceiling: 60.0, step: 0.5, growth: 1.1, slow_start_cap: 60.0, hard_floor: 20.0, burst_credit: 0.0, sustain: 0.0 }
     }
 
     /// What the engine used before: start at 8/s, slow start to 40/s, then probe slowly up to 150/s.
     fn legacy_cfg() -> PacerCfg {
-        PacerCfg { rate: 8.0, burst: 8.0, ceiling: 150.0, step: 0.5, growth: 1.5, slow_start_cap: 40.0, hard_floor: 1.0 }
+        PacerCfg { rate: 8.0, burst: 8.0, ceiling: 150.0, step: 0.5, growth: 1.5, slow_start_cap: 40.0, hard_floor: 1.0, burst_credit: 0.0, sustain: 0.0 }
     }
 
     /// Drive the pacer for `secs` seconds in 50 ms ticks, sending at the pacer's current rate.
@@ -324,7 +395,7 @@ mod sim {
         for tick in 0..secs * 20 {
             let t = tick as f64 * 0.05;
             let now = t0 + Duration::from_secs_f64(t);
-            let rate = p.rate();
+            let rate = p.effective_rate();
             if t >= paused_until {
                 carry += rate * 0.05;
                 let n = carry.floor();
@@ -459,7 +530,7 @@ mod sim {
 
     /// Upload defaults of cbgram: start at 28/s with no exponential overshoot, climb ~3%/s while calm.
     fn upload_cfg() -> PacerCfg {
-        PacerCfg { rate: 24.0, burst: 4.0, ceiling: 40.0, step: 0.5, growth: 1.1, slow_start_cap: 24.0, hard_floor: 20.0 }
+        PacerCfg { rate: 24.0, burst: 4.0, ceiling: 40.0, step: 0.5, growth: 1.1, slow_start_cap: 24.0, hard_floor: 20.0, burst_credit: 0.0, sustain: 0.0 }
     }
 
     /// Where the server accepts more than the start: begin at 28 and climb towards the top, never flooding.
@@ -490,7 +561,7 @@ mod sim {
     /// below the dip band's three quarters, and the next transfer must start from the dip level.
     #[test]
     fn repeating_one_second_floods_do_not_collapse_the_rate() {
-        let cfg = PacerCfg { rate: 48.0, burst: 8.0, ceiling: 80.0, step: 1.0, growth: 1.1, slow_start_cap: 48.0, hard_floor: 40.0 };
+        let cfg = PacerCfg { rate: 48.0, burst: 8.0, ceiling: 80.0, step: 1.0, growth: 1.1, slow_start_cap: 48.0, hard_floor: 40.0, burst_credit: 0.0, sustain: 0.0 };
         let base = Instant::now();
         let p = Pacer::new_at(&cfg, base);
         let mut t = 0.0;
@@ -524,4 +595,68 @@ mod sim {
         assert!(avg(&eff[15..50]) >= 3.0, "keeps moving during the refusal (a fixed 20 floor moves ~1): {:.1}", avg(&eff[15..50]));
         assert!(tr[85] >= 20.0, "35 s after it lets go it is back above 20: {}", tr[85]);
     }
+
+    /// A server that lets a bot send fast until a bank of `b` MiB is spent, then only `r` MiB/s
+    /// (flood on every request beyond it). This is the pattern in the production logs: short files fly,
+    /// long files hit the wall after ~80-100 MiB and lose seconds to floods.
+    fn bank_server(b: f64, r: f64) -> impl FnMut(f64, f64) -> bool {
+        let (mut bucket, mut last) = (b, 0.0f64);
+        move |t, rate| {
+            let dt = t - last;
+            last = t;
+            // refill for all the time that passed (including a pause), spend only for the tick that sent
+            bucket = (bucket + r * dt).min(b) - rate * dt.min(0.05);
+            if bucket < 0.0 {
+                bucket = 0.0;
+                true
+            } else {
+                false
+            }
         }
+    }
+
+    fn upload_cfg2(credit: bool) -> PacerCfg {
+        PacerCfg {
+            rate: 32.0, burst: 4.0, ceiling: 40.0, step: 0.5, growth: 1.1, slow_start_cap: 32.0, hard_floor: 20.0,
+            burst_credit: if credit { 80.0 } else { 0.0 }, sustain: if credit { 22.0 } else { 0.0 },
+        }
+    }
+
+    #[test]
+    fn burst_credit_beats_probing_on_a_bank_server() {
+        for (label, secs) in [("short file (first 6 s)", 6usize), ("long file (60 s)", 60)] {
+            let (_, f_old, e_old) = run_cfg_eff(upload_cfg2(false), secs, 2.0, bank_server(90.0, 20.0));
+            let (tr, f_new, e_new) = run_cfg_eff(upload_cfg2(true), secs, 2.0, bank_server(90.0, 20.0));
+            println!("\n[L] {label}: old avg {:.1}/s floods {} | credit avg {:.1}/s floods {}  min-second {:.1}",
+                avg(&e_old), f_old, avg(&e_new), f_new, min(&e_new));
+            println!("    credit, per-second throughput: {:?}", e_new.iter().map(|r| r.round() as i64).collect::<Vec<_>>());
+            if secs == 60 {
+                assert!(f_new * 2 <= f_old, "far fewer floods than probing: {f_new} vs {f_old}");
+                assert!(avg(&e_new) >= 0.95 * avg(&e_old), "as fast on a long file: {:.1} vs {:.1}", avg(&e_new), avg(&e_old));
+                assert!(avg(&e_new) >= 19.0, "long-file average {:.1}", avg(&e_new));
+                assert!(tr.iter().all(|r| *r >= 20.0), "pace never below the 20 dip level");
+            } else {
+                assert!(avg(&e_new) >= 28.0, "a short file is mostly inside the burst: {:.1}", avg(&e_new));
+            }
+        }
+    }
+
+    /// A plain rate limit (no bank) and a server with no limit at all: the credit model must not make
+    /// either worse in a way that matters.
+    #[test]
+    fn burst_credit_on_other_kinds_of_servers() {
+        // plain limit 25/s
+        let plain = |credit| run_cfg_eff(upload_cfg2(credit), 60, 2.0, |_t, rate| rate > 25.0);
+        let (_, f_old, e_old) = plain(false);
+        let (_, f_new, e_new) = plain(true);
+        println!("\n[M] plain limit 25/s: old avg {:.1} floods {} | credit avg {:.1} floods {}", avg(&e_old), f_old, avg(&e_new), f_new);
+        assert!(avg(&e_new) >= 0.9 * avg(&e_old), "plain limit: {:.1} vs {:.1}", avg(&e_new), avg(&e_old));
+        assert!(f_new <= f_old + 2, "plain limit: {f_new} floods vs {f_old}");
+        // no limit: the bank only delays the climb; it must climb on its own
+        let (tr, _, e_new) = run_cfg_eff(upload_cfg2(true), 120, 2.0, |_, _| false);
+        let (_, _, e_old) = run_cfg_eff(upload_cfg2(false), 120, 2.0, |_, _| false);
+        println!("[N] no limit, 120 s: old avg {:.1} | credit avg {:.1}  last 30 s {:.1}", avg(&e_old), avg(&e_new), avg(&e_new[90..]));
+        assert!(avg(&e_new[90..]) >= 35.0, "credit must climb back to the top when nothing refuses: {:.1}", avg(&e_new[90..]));
+        assert!(tr.iter().all(|r| *r <= 40.0 + 1e-9));
+    }
+                    }
