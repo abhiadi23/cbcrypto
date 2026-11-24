@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="assets/logo(1).png" alt="cbcrypto" width="420">
+<img src="assets/logo (1).png" alt="cbcrypto" width="420">
 
 <br><br>
 
