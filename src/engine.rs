@@ -646,6 +646,7 @@ fn pool_take(cfg: &ConnCfg) -> Option<Conn> {
 struct Shared {
     cancel: AtomicBool,
     err: Mutex<Option<EngineError>>,
+    last_err: Mutex<Option<EngineError>>,
     done_bytes: AtomicU64,
     active: AtomicUsize,
     next: AtomicUsize,
@@ -681,6 +682,17 @@ impl Shared {
             *g = Some(e);
         }
         self.cancel.store(true, Ordering::SeqCst);
+    }
+
+    /// A worker ran out of reconnect attempts. Its chunks are already back in the queue, so while other
+    /// connections are alive they carry on and the transfer survives; only the last worker standing
+    /// turns this into a failure of the whole transfer.
+    fn give_up(&self, e: EngineError) {
+        if self.active.load(Ordering::SeqCst) > 1 {
+            *self.last_err.lock().unwrap() = Some(e);
+            return;
+        }
+        self.fail(e);
     }
 
     fn take(&self) -> Option<usize> {
@@ -990,7 +1002,7 @@ fn worker(sh: Arc<Shared>, cfg: TransferCfg) {
                 Err(e) => {
                     failures += 1;
                     if failures > cfg.max_reconnects {
-                        sh.fail(e);
+                        sh.give_up(e);
                         break;
                     }
                     if !sh.sleep_cancellable(0.5 * failures as f64) {
@@ -1001,7 +1013,14 @@ fn worker(sh: Arc<Shared>, cfg: TransferCfg) {
             }
         }
         let c = conn.as_mut().unwrap();
-        match run_session(&sh, &cfg, c, &mut inflight) {
+        let done_before = sh.completed.load(Ordering::Relaxed);
+        let result = run_session(&sh, &cfg, c, &mut inflight);
+        // a connection that moved data before it broke is a healthy one: the budget is for consecutive
+        // failures, not for every reset over the life of a multi-GB transfer
+        if sh.completed.load(Ordering::Relaxed) > done_before {
+            failures = 0;
+        }
+        match result {
             Ok(()) => {
                 clean = c.flush_acks(true).is_ok();
                 break;
@@ -1023,7 +1042,7 @@ fn worker(sh: Arc<Shared>, cfg: TransferCfg) {
                 conn = None;
                 failures += 1;
                 if failures > cfg.max_reconnects {
-                    sh.fail(e);
+                    sh.give_up(e);
                     break;
                 }
                 if !sh.sleep_cancellable(0.5 * failures as f64) {
@@ -1094,6 +1113,7 @@ fn run_transfer(
     let sh = Arc::new(Shared {
         cancel: AtomicBool::new(false),
         err: Mutex::new(None),
+        last_err: Mutex::new(None),
         done_bytes: AtomicU64::new(0),
         active: AtomicUsize::new(0),
         next: AtomicUsize::new(first_unit),
@@ -1199,6 +1219,9 @@ fn run_transfer(
         size - (first_unit as u64 * unit).min(size)
     };
     if done != expected {
+        if let Some(e) = sh.last_err.lock().unwrap().take() {
+            return Err(to_pyerr(e));
+        }
         return Err(to_pyerr(EngineError::Protocol(format!("incomplete transfer: {done} of {expected} bytes"))));
     }
     Ok(done)
@@ -1673,6 +1696,7 @@ mod e2e_tests {
         let sh = Arc::new(Shared {
             cancel: AtomicBool::new(false),
             err: Mutex::new(None),
+            last_err: Mutex::new(None),
             done_bytes: AtomicU64::new(0),
             active: AtomicUsize::new(conns),
             next: AtomicUsize::new(0),
