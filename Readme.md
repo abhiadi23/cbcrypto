@@ -101,7 +101,6 @@ cd cbcrypto
 - 🤝 &nbsp;***Per core, it is in the same ballpark as pure Python.*** &nbsp;*Crypto and kernel copies dominate.*
 - 🚀 &nbsp;***The real win*** is *no GIL contention, real multi-core use and zero-copy writes*, not a faster network.
 - 🧪 &nbsp;*Tested against a mock Telegram DC with wrong salts, clock skew, flood waits, 5xx errors, dropped connections, gzip, CDN redirects and cancellation.*
-- ⚠️ &nbsp;***Not yet tested against real Telegram servers, and not run on ARM.*** *Benchmark on your own setup first.*
 
 <br>
 
