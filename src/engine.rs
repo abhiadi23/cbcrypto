@@ -710,13 +710,11 @@ impl Shared {
         self.retry.lock().unwrap().push_back(i);
     }
 
-    /// How many chunks one connection may have in flight: its equal share of the chunks nobody
-    /// has been given yet (never less than 1, never more than the configured window).
+    /// How many unfinished chunks one connection can keep in flight at once.
     fn fair_share(&self) -> usize {
-        let unassigned = self.total.saturating_sub(self.next.load(Ordering::Relaxed))
-            + self.retry.lock().unwrap().len();
+        let unfinished = self.remaining.saturating_sub(self.completed.load(Ordering::Relaxed));
         let active = self.active.load(Ordering::Relaxed).max(1);
-        ((unassigned + active - 1) / active).max(1)
+        unfinished.div_ceil(active).max(1)
     }
 
     fn sleep_cancellable(&self, secs: f64) -> bool {
@@ -812,15 +810,19 @@ fn run_session(sh: &Shared, cfg: &TransferCfg, c: &mut Conn, inflight: &mut Hash
         if sh.cancel.load(Ordering::Relaxed) {
             return Err(EngineError::Cancelled);
         }
-        // fill the pipeline, but only with this connection's fair share of what is still unassigned:
-        // otherwise the first connection to come up takes `inflight` chunks of a small file all by
-        // itself (4 chunks = 3 serial on one connection) and the other connections sit idle, and at
-        // the end of a transfer one connection is left with the whole tail
+        // Count requests already in flight when sizing the pipeline. This spreads small transfers
+        // across workers while leaving room to refill as responses arrive.
         let window = cfg.inflight.min(sh.fair_share());
         while inflight.len() < window {
             let Some(idx) = sh.take() else { break };
             if let Some(p) = &sh.pacer {
-                if !p.acquire(&sh.cancel) {
+                if cfg.mode == Mode::Download && !inflight.is_empty() {
+                    // Process replies already on the way while the pacer limits new sends.
+                    if !p.try_acquire() {
+                        sh.requeue(idx);
+                        break;
+                    }
+                } else if !p.acquire(&sh.cancel) {
                     sh.requeue(idx);
                     return Err(EngineError::Cancelled);
                 }
@@ -1545,11 +1547,14 @@ mod e2e_tests {
     use std::net::TcpListener;
     use std::sync::atomic::AtomicUsize as AU;
 
+    const TEST_GET_FILE: u32 = 0x0387_a08e;
+
     pub struct Srv {
         pub limit: usize,
         pub accepted: AU,
         pub parts: Mutex<HashSet<i32>>,
         pub flood_replies: AU,
+        first_download_reply: Mutex<Option<std::sync::mpsc::Sender<()>>>,
         window: Mutex<VecDeque<Instant>>,
         penalty: Mutex<Option<Instant>>,
     }
@@ -1652,6 +1657,21 @@ mod e2e_tests {
             let msg_id = i64::from_le_bytes(plain[16..24].try_into().unwrap());
             let len = u32::from_le_bytes(plain[28..32].try_into().unwrap()) as usize;
             let body = &plain[32..32 + len];
+            if rd_u32(body, 0) == Some(TEST_GET_FILE) {
+                let limit = rd_i32(body, 12).unwrap() as usize;
+                let mut reply = RPC_RESULT.to_le_bytes().to_vec();
+                reply.extend_from_slice(&msg_id.to_le_bytes());
+                reply.extend_from_slice(&UPLOAD_FILE.to_le_bytes());
+                reply.extend_from_slice(&[0; 8]); // storage type and mtime
+                tl_bytes_put(&mut reply, &vec![7; limit]);
+                counter += 1;
+                let packet = srv_packet(&mut tx, &auth_key, &session_id, 0x6000_0000_0000_0000 + counter * 4 + 1, &reply);
+                s.write_all(&packet).unwrap();
+                if let Some(sent) = st.first_download_reply.lock().unwrap().take() {
+                    let _ = sent.send(());
+                }
+                continue;
+            }
             if body.len() < 20 || u32::from_le_bytes(body[0..4].try_into().unwrap()) != SAVE_BIG_FILE_PART {
                 continue; // an ack
             }
@@ -1729,6 +1749,7 @@ mod e2e_tests {
             accepted: AU::new(0),
             parts: Mutex::new(HashSet::new()),
             flood_replies: AU::new(0),
+            first_download_reply: Mutex::new(None),
             window: Mutex::new(VecDeque::new()),
             penalty: Mutex::new(None),
         });
@@ -1747,12 +1768,23 @@ mod e2e_tests {
         pub secs: f64,
     }
 
-    /// Upload `parts` parts of `unit` bytes with `conns` workers and the given pacer settings.
     pub fn upload(port: u16, auth_key: &[u8], parts: usize, unit: u64, conns: usize, rate: f64, ceiling: f64) -> Out {
+        transfer(port, auth_key, parts, unit, conns, rate, ceiling, Mode::Upload)
+    }
+
+    fn transfer_path(port: u16, parts: usize) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("cbcrypto-e2e-{}-{}-{}", port, parts, std::process::id()))
+    }
+
+    fn transfer(port: u16, auth_key: &[u8], parts: usize, unit: u64, conns: usize, rate: f64, ceiling: f64, mode: Mode) -> Out {
         let size = parts as u64 * unit;
-        let path = std::env::temp_dir().join(format!("cbcrypto-e2e-{}-{}-{}", port, parts, std::process::id()));
-        std::fs::write(&path, vec![7u8; size as usize]).unwrap();
-        let file = File::open(&path).unwrap();
+        let path = transfer_path(port, parts);
+        let file = if mode == Mode::Download {
+            File::create(&path).unwrap()
+        } else {
+            std::fs::write(&path, vec![7u8; size as usize]).unwrap();
+            File::open(&path).unwrap()
+        };
         let conn = ConnCfg {
             host: "127.0.0.1".into(),
             port,
@@ -1766,15 +1798,16 @@ mod e2e_tests {
         };
         let cfg = TransferCfg {
             conn,
-            mode: Mode::Upload,
+            mode,
             inflight: 4,
             max_reconnects: 5,
-            req_prefix: Vec::new(),
+            req_prefix: TEST_GET_FILE.to_le_bytes().to_vec(),
             file_id: 42,
             is_big: true,
             total_parts: parts as i32,
         };
-        let pc = PacerCfg { rate, burst: 8.0, ceiling, step: 1.0, growth: 1.1, slow_start_cap: rate, hard_floor: 20.0, burst_credit: 0.0, sustain: 0.0 };
+        let burst = if mode == Mode::Download { 1.0 } else { 8.0 };
+        let pc = PacerCfg { rate, burst, ceiling, step: 1.0, growth: 1.1, slow_start_cap: rate, hard_floor: 20.0, burst_credit: 0.0, sustain: 0.0 };
         let sh = Arc::new(Shared {
             cancel: AtomicBool::new(false),
             err: Mutex::new(None),
@@ -1820,6 +1853,30 @@ mod e2e_tests {
 
     pub fn failed(o: &Out) -> Option<String> {
         o.sh.err.lock().unwrap().as_ref().map(|e| format!("{e:?}"))
+    }
+
+    #[test]
+    fn download_writes_ready_chunk_before_waiting_for_next_send_permit() {
+        let (port, srv, key) = start_server(4, 100_000, false);
+        let (sent, received) = std::sync::mpsc::channel();
+        *srv.first_download_reply.lock().unwrap() = Some(sent);
+        // With a burst of one, the second request has to wait four seconds.
+        let worker = std::thread::spawn(move || transfer(port, &key, 2, 4096, 1, 0.25, 0.25, Mode::Download));
+        received.recv_timeout(Duration::from_secs(5)).unwrap();
+        let path = transfer_path(port, 2);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut first_chunk_ready = false;
+        while Instant::now() < deadline {
+            if std::fs::read(&path).is_ok_and(|data| data.len() == 4096 && data.iter().all(|&byte| byte == 7)) {
+                first_chunk_ready = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let out = worker.join().unwrap();
+        assert!(first_chunk_ready, "the first reply must be written before the next send permit");
+        assert!(failed(&out).is_none(), "transfer failed: {:?}", failed(&out));
+        assert_eq!(out.sh.done_bytes.load(Ordering::Relaxed), 2 * 4096);
     }
 
     #[test]
