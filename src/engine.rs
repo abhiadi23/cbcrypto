@@ -259,6 +259,12 @@ impl Conn {
             .ok_or_else(|| EngineError::Io("address did not resolve".into()))?;
         let s = TcpStream::connect_timeout(&addr, Duration::from_secs(10)).map_err(ioerr)?;
         let _ = s.set_nodelay(true);
+        // keep parked and idle-while-paused connections alive: a socket that sends nothing during a flood
+        // pause or between files gets dropped by the NAT / the peer and then fails with "reset by peer"
+        let ka = socket2::TcpKeepalive::new()
+            .with_time(Duration::from_secs(15))
+            .with_interval(Duration::from_secs(10));
+        let _ = socket2::SockRef::from(&s).set_tcp_keepalive(&ka);
         // BBR ramps up faster and holds its speed on a long or slightly lossy path (cubic backs off on
         // every loss). Best effort: a kernel or sandbox without it just keeps its default.
         #[cfg(target_os = "linux")]
@@ -980,6 +986,19 @@ fn run_session(sh: &Shared, cfg: &TransferCfg, c: &mut Conn, inflight: &mut Hash
     }
 }
 
+/// 0.5 s, 1 s, 2 s, 4 s, 8 s, then 8 s, plus up to 0.5 s of jitter so that 15 workers whose sockets
+/// were reset together do not all dial again in the same instant.
+fn backoff_secs(failures: u32) -> f64 {
+    let base = (0.5 * 2f64.powi(failures.saturating_sub(1).min(4) as i32)).min(8.0);
+    let jitter = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| (d.subsec_nanos() % 500) as f64 / 1000.0)
+        .unwrap_or(0.0);
+    base + jitter
+}
+
+static RECONNECT_LOGS: AtomicUsize = AtomicUsize::new(0);
+
 fn worker(sh: Arc<Shared>, cfg: TransferCfg) {
     let mut conn: Option<Conn> = None;
     let mut inflight: HashMap<i64, usize> = HashMap::new();
@@ -1005,7 +1024,7 @@ fn worker(sh: Arc<Shared>, cfg: TransferCfg) {
                         sh.give_up(e);
                         break;
                     }
-                    if !sh.sleep_cancellable(0.5 * failures as f64) {
+                    if !sh.sleep_cancellable(backoff_secs(failures)) {
                         break;
                     }
                     continue;
@@ -1033,8 +1052,15 @@ fn worker(sh: Arc<Shared>, cfg: TransferCfg) {
                 if matches!(e, EngineError::Timeout(_)) {
                     sh.timeouts.fetch_add(1, Ordering::Relaxed);
                 }
-                if std::env::var_os("CBCRYPTO_DEBUG").is_some() {
-                    eprintln!("[cbcrypto] reconnecting after: {e:?}");
+                // always say WHY a connection was lost (a few lines per process, so the log never floods):
+                // "transport error -429" = Telegram refused us, a bare "Connection reset" = the network did
+                if std::env::var_os("CBCRYPTO_DEBUG").is_some() || RECONNECT_LOGS.fetch_add(1, Ordering::Relaxed) < 40 {
+                    eprintln!(
+                        "[cbcrypto] connection lost: {e:?} | {} MiB done, {} connections, failure #{}",
+                        sh.done_bytes.load(Ordering::Relaxed) >> 20,
+                        sh.active.load(Ordering::Relaxed),
+                        failures + 1
+                    );
                 }
                 for (_, idx) in inflight.drain() {
                     sh.requeue(idx);
@@ -1045,7 +1071,7 @@ fn worker(sh: Arc<Shared>, cfg: TransferCfg) {
                     sh.give_up(e);
                     break;
                 }
-                if !sh.sleep_cancellable(0.5 * failures as f64) {
+                if !sh.sleep_cancellable(backoff_secs(failures)) {
                     break;
                 }
             }
