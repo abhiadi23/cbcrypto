@@ -61,6 +61,7 @@ pub(crate) fn constants() -> Vec<(&'static str, u32)> {
 #[derive(Debug, Clone)]
 pub enum EngineError {
     Io(String),
+    PeerDisconnected(String),
     FileIo(String),
     Timeout(String),
     Rpc { code: i32, message: String },
@@ -83,13 +84,16 @@ fn ioerr(e: std::io::Error) -> EngineError {
     use std::io::ErrorKind::*;
     match e.kind() {
         WouldBlock | TimedOut => EngineError::Timeout(e.to_string()),
+        BrokenPipe | ConnectionAborted | ConnectionReset | UnexpectedEof => {
+            EngineError::PeerDisconnected(e.to_string())
+        }
         _ => EngineError::Io(e.to_string()),
     }
 }
 
 fn to_pyerr(e: EngineError) -> PyErr {
     let (kind, code, msg) = match e {
-        EngineError::Io(m) | EngineError::FileIo(m) => ("io", 0, m),
+        EngineError::Io(m) | EngineError::PeerDisconnected(m) | EngineError::FileIo(m) => ("io", 0, m),
         EngineError::Timeout(m) => ("timeout", 0, m),
         EngineError::Rpc { code, message } => ("rpc", code, message),
         EngineError::Cdn => ("cdn", 0, String::new()),
@@ -404,7 +408,9 @@ impl Conn {
         self.rbuf.resize(n, 0);
         self.s.read_exact(&mut self.rbuf[..n]).map_err(|e| match e.kind() {
             std::io::ErrorKind::UnexpectedEof => {
-                EngineError::Io(format!("connection closed by peer while reading {field} ({n} bytes expected)"))
+                EngineError::PeerDisconnected(format!(
+                    "connection closed by peer while reading {field} ({n} bytes expected)"
+                ))
             }
             _ => ioerr(e),
         })
@@ -710,11 +716,12 @@ impl Shared {
         self.retry.lock().unwrap().push_back(i);
     }
 
-    /// How many unfinished chunks one connection can keep in flight at once.
+    /// Keep pending chunks spread across workers as the unassigned queue gets shorter.
     fn fair_share(&self) -> usize {
-        let unfinished = self.remaining.saturating_sub(self.completed.load(Ordering::Relaxed));
+        let unassigned = self.total.saturating_sub(self.next.load(Ordering::Relaxed))
+            + self.retry.lock().unwrap().len();
         let active = self.active.load(Ordering::Relaxed).max(1);
-        unfinished.div_ceil(active).max(1)
+        unassigned.div_ceil(active).max(1)
     }
 
     fn sleep_cancellable(&self, secs: f64) -> bool {
@@ -810,8 +817,6 @@ fn run_session(sh: &Shared, cfg: &TransferCfg, c: &mut Conn, inflight: &mut Hash
         if sh.cancel.load(Ordering::Relaxed) {
             return Err(EngineError::Cancelled);
         }
-        // Count requests already in flight when sizing the pipeline. This spreads small transfers
-        // across workers while leaving room to refill as responses arrive.
         let window = cfg.inflight.min(sh.fair_share());
         while inflight.len() < window {
             let Some(idx) = sh.take() else { break };
@@ -1011,7 +1016,7 @@ fn backoff_secs(failures: u32) -> f64 {
 
 static RECONNECT_LOGS: AtomicUsize = AtomicUsize::new(0);
 
-fn worker(sh: Arc<Shared>, cfg: TransferCfg) {
+fn worker(sh: Arc<Shared>, mut cfg: TransferCfg) {
     let mut conn: Option<Conn> = None;
     let mut inflight: HashMap<i64, usize> = HashMap::new();
     let mut failures = 0u32;
@@ -1057,18 +1062,23 @@ fn worker(sh: Arc<Shared>, cfg: TransferCfg) {
             Err(EngineError::Cancelled) => {
                 break;
             }
-            Err(e @ (EngineError::Io(_) | EngineError::Timeout(_))) => {
+            Err(e @ (EngineError::Io(_) | EngineError::PeerDisconnected(_) | EngineError::Timeout(_))) => {
                 sh.reconnects.fetch_add(1, Ordering::Relaxed);
                 if matches!(e, EngineError::Timeout(_)) {
                     sh.timeouts.fetch_add(1, Ordering::Relaxed);
+                }
+                if cfg.mode == Mode::Download && matches!(e, EngineError::PeerDisconnected(_)) {
+                    // Retry on a fresh socket with fewer outstanding download requests.
+                    cfg.inflight = cfg.inflight.div_ceil(2);
                 }
                 // always say WHY a connection was lost (a few lines per process, so the log never floods):
                 // "transport error -429" = Telegram refused us, a bare "Connection reset" = the network did
                 if std::env::var_os("CBCRYPTO_DEBUG").is_some() || RECONNECT_LOGS.fetch_add(1, Ordering::Relaxed) < 40 {
                     eprintln!(
-                        "[cbcrypto] connection lost: {e:?} | {} MiB done, {} connections, failure #{}",
+                        "[cbcrypto] connection lost: {e:?} | {} MiB done, {} connections, next window {}, failure #{}",
                         sh.done_bytes.load(Ordering::Relaxed) >> 20,
                         sh.active.load(Ordering::Relaxed),
+                        cfg.inflight,
                         failures + 1
                     );
                 }
@@ -1555,6 +1565,7 @@ mod e2e_tests {
         pub parts: Mutex<HashSet<i32>>,
         pub flood_replies: AU,
         first_download_reply: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+        reject_download_pipeline: AtomicBool,
         window: Mutex<VecDeque<Instant>>,
         penalty: Mutex<Option<Instant>>,
     }
@@ -1658,6 +1669,21 @@ mod e2e_tests {
             let len = u32::from_le_bytes(plain[28..32].try_into().unwrap()) as usize;
             let body = &plain[32..32 + len];
             if rd_u32(body, 0) == Some(TEST_GET_FILE) {
+                if counter == 0 && st.reject_download_pipeline.load(Ordering::Relaxed) {
+                    // Reset sockets that send a second request before the first reply.
+                    s.set_read_timeout(Some(Duration::from_millis(500))).unwrap();
+                    let mut next = [0];
+                    match s.peek(&mut next) {
+                        Ok(0) => return,
+                        Ok(_) => {
+                            socket2::SockRef::from(&s).set_linger(Some(Duration::ZERO)).unwrap();
+                            return;
+                        }
+                        Err(e) if matches!(e.kind(), std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock) => {}
+                        Err(_) => return,
+                    }
+                    s.set_read_timeout(None).unwrap();
+                }
                 let limit = rd_i32(body, 12).unwrap() as usize;
                 let mut reply = RPC_RESULT.to_le_bytes().to_vec();
                 reply.extend_from_slice(&msg_id.to_le_bytes());
@@ -1750,6 +1776,7 @@ mod e2e_tests {
             parts: Mutex::new(HashSet::new()),
             flood_replies: AU::new(0),
             first_download_reply: Mutex::new(None),
+            reject_download_pipeline: AtomicBool::new(false),
             window: Mutex::new(VecDeque::new()),
             penalty: Mutex::new(None),
         });
@@ -1817,7 +1844,7 @@ mod e2e_tests {
             next: AtomicUsize::new(0),
             total: parts,
             retry: Mutex::new(VecDeque::new()),
-            pacer: Some(make_pacer(&cfg, &pc)),
+            pacer: (rate > 0.0).then(|| make_pacer(&cfg, &pc)),
             flood_slept: Mutex::new(0.0),
             flood_events: Mutex::new(Vec::new()),
             floods: AtomicU64::new(0),
@@ -1877,6 +1904,16 @@ mod e2e_tests {
         assert!(first_chunk_ready, "the first reply must be written before the next send permit");
         assert!(failed(&out).is_none(), "transfer failed: {:?}", failed(&out));
         assert_eq!(out.sh.done_bytes.load(Ordering::Relaxed), 2 * 4096);
+    }
+
+    #[test]
+    fn download_reduces_pipeline_after_repeated_peer_resets() {
+        let (port, srv, key) = start_server(5, 100_000, false);
+        srv.reject_download_pipeline.store(true, Ordering::Relaxed);
+        let out = transfer(port, &key, 4, 4096, 1, 0.0, 0.0, Mode::Download);
+        assert!(failed(&out).is_none(), "transfer failed: {:?}", failed(&out));
+        assert_eq!(out.sh.reconnects.load(Ordering::Relaxed), 2);
+        assert_eq!(out.sh.done_bytes.load(Ordering::Relaxed), 4 * 4096);
     }
 
     #[test]
