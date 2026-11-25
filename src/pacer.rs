@@ -171,29 +171,37 @@ impl Pacer {
             if cancel.load(Ordering::Relaxed) {
                 return false;
             }
-            let wait = {
-                let mut s = self.st.lock().unwrap();
-                let now = Instant::now();
-                if let Some(t) = s.pause_until {
-                    if now < t {
-                        let left = t.duration_since(now).as_secs_f64();
-                        drop(s);
-                        std::thread::sleep(Duration::from_secs_f64(left.min(0.05)));
-                        continue;
-                    }
-                    s.pause_until = None;
-                    s.tokens = 0.0; // no burst when the cooldown ends
-                    s.last_refill = now;
-                }
-                Self::refill(&mut s, Instant::now());
-                if s.tokens >= 1.0 {
-                    s.tokens -= 1.0;
-                    Self::note_grant(&mut s, Instant::now(), 1);
-                    return true;
-                }
-                (1.0 - s.tokens) / Self::eff_rate(&s).max(0.001)
+            let Some(wait) = self.acquire_delay() else {
+                return true;
             };
             std::thread::sleep(Duration::from_secs_f64(wait.min(0.05)));
+        }
+    }
+
+    /// Spend a send permit only if one is available now.
+    pub fn try_acquire(&self) -> bool {
+        self.acquire_delay().is_none()
+    }
+
+    /// Grant one permit or return how long to wait before trying again.
+    fn acquire_delay(&self) -> Option<f64> {
+        let mut s = self.st.lock().unwrap();
+        let now = Instant::now();
+        if let Some(t) = s.pause_until {
+            if now < t {
+                return Some(t.duration_since(now).as_secs_f64());
+            }
+            s.pause_until = None;
+            s.tokens = 0.0; // no burst when the cooldown ends
+            s.last_refill = now;
+        }
+        Self::refill(&mut s, now);
+        if s.tokens >= 1.0 {
+            s.tokens -= 1.0;
+            Self::note_grant(&mut s, now, 1);
+            None
+        } else {
+            Some((1.0 - s.tokens) / Self::eff_rate(&s).max(0.001))
         }
     }
 
