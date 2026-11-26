@@ -61,8 +61,6 @@ pub(crate) fn constants() -> Vec<(&'static str, u32)> {
 #[derive(Debug, Clone)]
 pub enum EngineError {
     Io(String),
-    PeerDisconnected(String),
-    FileIo(String),
     Timeout(String),
     Rpc { code: i32, message: String },
     Cdn,
@@ -84,16 +82,13 @@ fn ioerr(e: std::io::Error) -> EngineError {
     use std::io::ErrorKind::*;
     match e.kind() {
         WouldBlock | TimedOut => EngineError::Timeout(e.to_string()),
-        BrokenPipe | ConnectionAborted | ConnectionReset | UnexpectedEof => {
-            EngineError::PeerDisconnected(e.to_string())
-        }
         _ => EngineError::Io(e.to_string()),
     }
 }
 
 fn to_pyerr(e: EngineError) -> PyErr {
     let (kind, code, msg) = match e {
-        EngineError::Io(m) | EngineError::PeerDisconnected(m) | EngineError::FileIo(m) => ("io", 0, m),
+        EngineError::Io(m) => ("io", 0, m),
         EngineError::Timeout(m) => ("timeout", 0, m),
         EngineError::Rpc { code, message } => ("rpc", code, message),
         EngineError::Cdn => ("cdn", 0, String::new()),
@@ -404,26 +399,22 @@ impl Conn {
         Ok(msg_id)
     }
 
-    fn read_exact(&mut self, n: usize, field: &str) -> Res<()> {
+    fn read_exact(&mut self, n: usize) -> Res<()> {
         self.rbuf.resize(n, 0);
         self.s.read_exact(&mut self.rbuf[..n]).map_err(|e| match e.kind() {
-            std::io::ErrorKind::UnexpectedEof => {
-                EngineError::PeerDisconnected(format!(
-                    "connection closed by peer while reading {field} ({n} bytes expected)"
-                ))
-            }
+            std::io::ErrorKind::UnexpectedEof => EngineError::Io("connection closed by peer".into()),
             _ => ioerr(e),
         })
     }
 
     /// Read one transport packet into `self.rbuf`.
     fn recv_packet(&mut self) -> Res<()> {
-        self.read_exact(1, "packet header")?;
+        self.read_exact(1)?;
         let mut first = [self.rbuf[0]];
         self.dec.apply(&mut first);
         let mut words = first[0] as usize;
         if first[0] == 0x7f {
-            self.read_exact(3, "extended packet length")?;
+            self.read_exact(3)?;
             let mut l = [self.rbuf[0], self.rbuf[1], self.rbuf[2]];
             self.dec.apply(&mut l);
             words = l[0] as usize | (l[1] as usize) << 8 | (l[2] as usize) << 16;
@@ -432,7 +423,7 @@ impl Conn {
         if len == 0 || len > (1 << 25) {
             return Err(EngineError::Protocol(format!("bad packet length {len}")));
         }
-        self.read_exact(len, "packet body")?;
+        self.read_exact(len)?;
         let mut buf = std::mem::take(&mut self.rbuf);
         self.dec.apply(&mut buf[..len]);
         self.rbuf = buf;
@@ -699,9 +690,15 @@ impl Shared {
         self.cancel.store(true, Ordering::SeqCst);
     }
 
-    /// The worker's chunks are back in the queue. Report its error if the transfer ends incomplete.
+    /// A worker ran out of reconnect attempts. Its chunks are already back in the queue, so while other
+    /// connections are alive they carry on and the transfer survives; only the last worker standing
+    /// turns this into a failure of the whole transfer.
     fn give_up(&self, e: EngineError) {
-        *self.last_err.lock().unwrap() = Some(e);
+        if self.active.load(Ordering::SeqCst) > 1 {
+            *self.last_err.lock().unwrap() = Some(e);
+            return;
+        }
+        self.fail(e);
     }
 
     fn take(&self) -> Option<usize> {
@@ -716,12 +713,13 @@ impl Shared {
         self.retry.lock().unwrap().push_back(i);
     }
 
-    /// Keep pending chunks spread across workers as the unassigned queue gets shorter.
+    /// How many chunks one connection may have in flight: its equal share of the chunks nobody
+    /// has been given yet (never less than 1, never more than the configured window).
     fn fair_share(&self) -> usize {
         let unassigned = self.total.saturating_sub(self.next.load(Ordering::Relaxed))
             + self.retry.lock().unwrap().len();
         let active = self.active.load(Ordering::Relaxed).max(1);
-        unassigned.div_ceil(active).max(1)
+        ((unassigned + active - 1) / active).max(1)
     }
 
     fn sleep_cancellable(&self, secs: f64) -> bool {
@@ -781,14 +779,7 @@ fn build_request(sh: &Shared, cfg: &TransferCfg, idx: usize) -> Res<Vec<u8>> {
         Mode::Upload => {
             let len = (sh.size - off).min(sh.unit) as usize;
             let mut data = vec![0u8; len];
-            read_exact_at(&sh.file, &mut data, off).map_err(|e| {
-                let reason = if e.kind() == std::io::ErrorKind::UnexpectedEof {
-                    "unexpected end of file".to_string()
-                } else {
-                    e.to_string()
-                };
-                EngineError::FileIo(format!("reading upload file at offset {off} ({len} bytes): {reason}"))
-            })?;
+            read_exact_at(&sh.file, &mut data, off).map_err(ioerr)?;
             let mut b = Vec::with_capacity(len + 40);
             b.extend_from_slice(&(if cfg.is_big { SAVE_BIG_FILE_PART } else { SAVE_FILE_PART }).to_le_bytes());
             b.extend_from_slice(&cfg.file_id.to_le_bytes());
@@ -812,22 +803,20 @@ fn send_chunk(sh: &Shared, cfg: &TransferCfg, c: &mut Conn, idx: usize) -> Res<i
 }
 
 /// One connected session's work loop. Returns Ok when there is nothing left to do.
-fn run_session(sh: &Shared, cfg: &TransferCfg, c: &mut Conn, inflight: &mut HashMap<i64, usize>, failures: &mut u32) -> Res<()> {
+fn run_session(sh: &Shared, cfg: &TransferCfg, c: &mut Conn, inflight: &mut HashMap<i64, usize>) -> Res<()> {
     loop {
         if sh.cancel.load(Ordering::Relaxed) {
             return Err(EngineError::Cancelled);
         }
+        // fill the pipeline, but only with this connection's fair share of what is still unassigned:
+        // otherwise the first connection to come up takes `inflight` chunks of a small file all by
+        // itself (4 chunks = 3 serial on one connection) and the other connections sit idle, and at
+        // the end of a transfer one connection is left with the whole tail
         let window = cfg.inflight.min(sh.fair_share());
         while inflight.len() < window {
             let Some(idx) = sh.take() else { break };
             if let Some(p) = &sh.pacer {
-                if cfg.mode == Mode::Download && !inflight.is_empty() {
-                    // Process replies already on the way while the pacer limits new sends.
-                    if !p.try_acquire() {
-                        sh.requeue(idx);
-                        break;
-                    }
-                } else if !p.acquire(&sh.cancel) {
+                if !p.acquire(&sh.cancel) {
                     sh.requeue(idx);
                     return Err(EngineError::Cancelled);
                 }
@@ -874,10 +863,7 @@ fn run_session(sh: &Shared, cfg: &TransferCfg, c: &mut Conn, inflight: &mut Hash
                             fatal = Some(EngineError::Protocol(format!("short chunk: got {} of {} bytes at offset {}", data.len(), expect, off)));
                             return Ok(());
                         }
-                        write_all_at(&sh.file, &data[..expect], off).map_err(|e| {
-                            EngineError::FileIo(format!("writing download file at offset {off} ({expect} bytes): {e}"))
-                        })?;
-                        *failures = 0;
+                        write_all_at(&sh.file, &data[..expect], off).map_err(ioerr)?;
                         sh.done_bytes.fetch_add(expect as u64, Ordering::Relaxed);
                         { sh.completed.fetch_add(1, Ordering::SeqCst); *sh.last_progress.lock().unwrap() = Instant::now(); }
                         if let Some(p) = &sh.pacer {
@@ -892,7 +878,6 @@ fn run_session(sh: &Shared, cfg: &TransferCfg, c: &mut Conn, inflight: &mut Hash
                             return Ok(());
                         }
                         let off = sh.start + idx as u64 * sh.unit;
-                        *failures = 0;
                         sh.done_bytes.fetch_add((sh.size - off).min(sh.unit), Ordering::Relaxed);
                         { sh.completed.fetch_add(1, Ordering::SeqCst); *sh.last_progress.lock().unwrap() = Instant::now(); }
                         if let Some(p) = &sh.pacer {
@@ -957,20 +942,18 @@ fn run_session(sh: &Shared, cfg: &TransferCfg, c: &mut Conn, inflight: &mut Hash
             }
             Ok(())
         });
-        if let Some(e) = fatal {
-            return Err(e);
-        }
-        let session_error = recv.err().or_else(|| {
-            reconnect.then(|| EngineError::Io("server asked for a fresh session".into()))
-        });
-        if let Some(e) = session_error {
-            for Act(idx, _) in acts {
+        if let Err(e) = recv {
+            for Act(idx, _) in acts.drain(..) {
                 sh.requeue(idx);
             }
             return Err(e);
         }
-        if sh.completed.load(Ordering::SeqCst) >= sh.remaining {
-            return Ok(());
+
+        if let Some(e) = fatal {
+            return Err(e);
+        }
+        if reconnect {
+            return Err(EngineError::Io("server asked for a fresh session".into()));
         }
         let mut acts: VecDeque<Act> = acts.into();
         while let Some(Act(idx, secs)) = acts.pop_front() {
@@ -1016,7 +999,7 @@ fn backoff_secs(failures: u32) -> f64 {
 
 static RECONNECT_LOGS: AtomicUsize = AtomicUsize::new(0);
 
-fn worker(sh: Arc<Shared>, mut cfg: TransferCfg) {
+fn worker(sh: Arc<Shared>, cfg: TransferCfg) {
     let mut conn: Option<Conn> = None;
     let mut inflight: HashMap<i64, usize> = HashMap::new();
     let mut failures = 0u32;
@@ -1026,9 +1009,6 @@ fn worker(sh: Arc<Shared>, mut cfg: TransferCfg) {
             break;
         }
         if conn.is_none() {
-            if failures > 0 && sh.completed.load(Ordering::SeqCst) >= sh.remaining {
-                break;
-            }
             // first connection of this worker: reuse a warm one if there is one. After an error the
             // worker always dials a fresh connection (the pool may hold ones from the same bad path).
             let warm = if failures == 0 { pool_take(&cfg.conn) } else { None };
@@ -1052,8 +1032,13 @@ fn worker(sh: Arc<Shared>, mut cfg: TransferCfg) {
             }
         }
         let c = conn.as_mut().unwrap();
-        // Only progress made on this connection resets its retry budget.
-        let result = run_session(&sh, &cfg, c, &mut inflight, &mut failures);
+        let done_before = sh.completed.load(Ordering::Relaxed);
+        let result = run_session(&sh, &cfg, c, &mut inflight);
+        // a connection that moved data before it broke is a healthy one: the budget is for consecutive
+        // failures, not for every reset over the life of a multi-GB transfer
+        if sh.completed.load(Ordering::Relaxed) > done_before {
+            failures = 0;
+        }
         match result {
             Ok(()) => {
                 clean = c.flush_acks(true).is_ok();
@@ -1062,23 +1047,18 @@ fn worker(sh: Arc<Shared>, mut cfg: TransferCfg) {
             Err(EngineError::Cancelled) => {
                 break;
             }
-            Err(e @ (EngineError::Io(_) | EngineError::PeerDisconnected(_) | EngineError::Timeout(_))) => {
+            Err(e @ (EngineError::Io(_) | EngineError::Timeout(_))) => {
                 sh.reconnects.fetch_add(1, Ordering::Relaxed);
                 if matches!(e, EngineError::Timeout(_)) {
                     sh.timeouts.fetch_add(1, Ordering::Relaxed);
-                }
-                if cfg.mode == Mode::Download && matches!(e, EngineError::PeerDisconnected(_)) {
-                    // Retry on a fresh socket with fewer outstanding download requests.
-                    cfg.inflight = cfg.inflight.div_ceil(2);
                 }
                 // always say WHY a connection was lost (a few lines per process, so the log never floods):
                 // "transport error -429" = Telegram refused us, a bare "Connection reset" = the network did
                 if std::env::var_os("CBCRYPTO_DEBUG").is_some() || RECONNECT_LOGS.fetch_add(1, Ordering::Relaxed) < 40 {
                     eprintln!(
-                        "[cbcrypto] connection lost: {e:?} | {} MiB done, {} connections, next window {}, failure #{}",
+                        "[cbcrypto] connection lost: {e:?} | {} MiB done, {} connections, failure #{}",
                         sh.done_bytes.load(Ordering::Relaxed) >> 20,
                         sh.active.load(Ordering::Relaxed),
-                        cfg.inflight,
                         failures + 1
                     );
                 }
@@ -1087,11 +1067,17 @@ fn worker(sh: Arc<Shared>, mut cfg: TransferCfg) {
                 }
                 conn = None;
                 failures += 1;
+                // "transport error -429" is Telegram saying we opened/used too many connections: redialling
+                // after half a second only earns another one, so wait it out properly
+                let extra = match &e {
+                    EngineError::Io(m) if m.contains("transport error -429") => 5.0,
+                    _ => 0.0,
+                };
                 if failures > cfg.max_reconnects {
                     sh.give_up(e);
                     break;
                 }
-                if !sh.sleep_cancellable(backoff_secs(failures)) {
+                if !sh.sleep_cancellable(backoff_secs(failures) + extra) {
                     break;
                 }
             }
@@ -1557,15 +1543,11 @@ mod e2e_tests {
     use std::net::TcpListener;
     use std::sync::atomic::AtomicUsize as AU;
 
-    const TEST_GET_FILE: u32 = 0x0387_a08e;
-
     pub struct Srv {
         pub limit: usize,
         pub accepted: AU,
         pub parts: Mutex<HashSet<i32>>,
         pub flood_replies: AU,
-        first_download_reply: Mutex<Option<std::sync::mpsc::Sender<()>>>,
-        reject_download_pipeline: AtomicBool,
         window: Mutex<VecDeque<Instant>>,
         penalty: Mutex<Option<Instant>>,
     }
@@ -1578,7 +1560,7 @@ mod e2e_tests {
         }
     }
 
-    fn srv_packet(tx: &mut CtrSt, auth_key: &[u8], session_id: &[u8], msg_id: i64, body: &[u8]) -> Vec<u8> {
+    fn srv_send(s: &mut TcpStream, tx: &mut CtrSt, auth_key: &[u8], session_id: &[u8], msg_id: i64, body: &[u8]) {
         let plain_len = 32 + body.len();
         let pad = (16 - (plain_len + 12) % 16) % 16 + 12;
         let total = 24 + plain_len + pad;
@@ -1604,37 +1586,15 @@ mod e2e_tests {
         }
         out.extend_from_slice(&buf);
         tx.apply(&mut out);
-        out
+        let _ = s.write_all(&out);
     }
 
-    fn request_new_session(msg_id: i64) -> Vec<u8> {
-        let mut reply = Vec::new();
-        reply.extend_from_slice(&CONTAINER.to_le_bytes());
-        reply.extend_from_slice(&2i32.to_le_bytes());
-        for (id, constructor, code, len) in [
-            (0x6000_0000_0000_0005i64, BAD_SERVER_SALT, 48i32, 28i32),
-            (0x6000_0000_0000_0009i64, BAD_MSG_NOTIFICATION, 32i32, 20i32),
-        ] {
-            reply.extend_from_slice(&id.to_le_bytes());
-            reply.extend_from_slice(&0i32.to_le_bytes()); // seq_no
-            reply.extend_from_slice(&len.to_le_bytes());
-            reply.extend_from_slice(&constructor.to_le_bytes());
-            reply.extend_from_slice(&msg_id.to_le_bytes());
-            reply.extend_from_slice(&1i32.to_le_bytes()); // bad_msg_seqno
-            reply.extend_from_slice(&code.to_le_bytes());
-            if constructor == BAD_SERVER_SALT {
-                reply.extend_from_slice(&1i64.to_le_bytes());
-            }
-        }
-        reply
-    }
-
-    fn serve(mut s: TcpStream, auth_key: Vec<u8>, st: Arc<Srv>, interrupt_connections: bool) {
+    fn serve(mut s: TcpStream, auth_key: Vec<u8>, st: Arc<Srv>) {
         let mut init = [0u8; 64];
         if s.read_exact(&mut init).is_err() {
             return;
         }
-        let connection = st.accepted.fetch_add(1, Ordering::SeqCst);
+        st.accepted.fetch_add(1, Ordering::SeqCst);
         let rev: Vec<u8> = init[8..56].iter().rev().copied().collect();
         let mut rx = CtrSt { key: init[8..40].try_into().unwrap(), iv: init[40..56].try_into().unwrap(), st: 0 };
         let mut skip = init;
@@ -1668,63 +1628,8 @@ mod e2e_tests {
             let msg_id = i64::from_le_bytes(plain[16..24].try_into().unwrap());
             let len = u32::from_le_bytes(plain[28..32].try_into().unwrap()) as usize;
             let body = &plain[32..32 + len];
-            if rd_u32(body, 0) == Some(TEST_GET_FILE) {
-                if counter == 0 && st.reject_download_pipeline.load(Ordering::Relaxed) {
-                    // Reset sockets that send a second request before the first reply.
-                    s.set_read_timeout(Some(Duration::from_millis(500))).unwrap();
-                    let mut next = [0];
-                    match s.peek(&mut next) {
-                        Ok(0) => return,
-                        Ok(_) => {
-                            socket2::SockRef::from(&s).set_linger(Some(Duration::ZERO)).unwrap();
-                            return;
-                        }
-                        Err(e) if matches!(e.kind(), std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock) => {}
-                        Err(_) => return,
-                    }
-                    s.set_read_timeout(None).unwrap();
-                }
-                let limit = rd_i32(body, 12).unwrap() as usize;
-                let mut reply = RPC_RESULT.to_le_bytes().to_vec();
-                reply.extend_from_slice(&msg_id.to_le_bytes());
-                reply.extend_from_slice(&UPLOAD_FILE.to_le_bytes());
-                reply.extend_from_slice(&[0; 8]); // storage type and mtime
-                tl_bytes_put(&mut reply, &vec![7; limit]);
-                counter += 1;
-                let packet = srv_packet(&mut tx, &auth_key, &session_id, 0x6000_0000_0000_0000 + counter * 4 + 1, &reply);
-                s.write_all(&packet).unwrap();
-                if let Some(sent) = st.first_download_reply.lock().unwrap().take() {
-                    let _ = sent.send(());
-                }
-                continue;
-            }
             if body.len() < 20 || u32::from_le_bytes(body[0..4].try_into().unwrap()) != SAVE_BIG_FILE_PART {
                 continue; // an ack
-            }
-            if interrupt_connections {
-                match connection {
-                    0 => {
-                        socket2::SockRef::from(&s).set_linger(Some(Duration::ZERO)).unwrap();
-                        return;
-                    }
-                    1 | 2 => {
-                        let reply = if connection == 1 {
-                            BOOL_TRUE.to_le_bytes().to_vec()
-                        } else {
-                            request_new_session(msg_id)
-                        };
-                        let mut packet = srv_packet(&mut tx, &auth_key, &session_id, 0x6000_0000_0000_000d, &reply);
-                        if connection == 1 {
-                            packet.truncate(packet.len() - 4);
-                        }
-                        s.write_all(&packet).unwrap();
-                        s.shutdown(std::net::Shutdown::Write).unwrap();
-                        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-                        let _ = std::io::copy(&mut s, &mut std::io::sink());
-                        return;
-                    }
-                    _ => {}
-                }
             }
             let part = i32::from_le_bytes(body[12..16].try_into().unwrap());
             let now = Instant::now();
@@ -1758,12 +1663,11 @@ mod e2e_tests {
                 reply.extend_from_slice(&BOOL_TRUE.to_le_bytes());
             }
             counter += 1;
-            let packet = srv_packet(&mut tx, &auth_key, &session_id, 0x6000_0000_0000_0000 + counter * 4 + 1, &reply);
-            let _ = s.write_all(&packet);
+            srv_send(&mut s, &mut tx, &auth_key, &session_id, 0x6000_0000_0000_0000 + counter * 4 + 1, &reply);
         }
     }
 
-    pub fn start_server(key: u8, limit: usize, interrupt_connections: bool) -> (u16, Arc<Srv>, Vec<u8>) {
+    pub fn start_server(key: u8, limit: usize) -> (u16, Arc<Srv>, Vec<u8>) {
         let l = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = l.local_addr().unwrap().port();
         let mut auth_key = vec![key; 256];
@@ -1775,8 +1679,6 @@ mod e2e_tests {
             accepted: AU::new(0),
             parts: Mutex::new(HashSet::new()),
             flood_replies: AU::new(0),
-            first_download_reply: Mutex::new(None),
-            reject_download_pipeline: AtomicBool::new(false),
             window: Mutex::new(VecDeque::new()),
             penalty: Mutex::new(None),
         });
@@ -1784,7 +1686,7 @@ mod e2e_tests {
         std::thread::spawn(move || {
             for s in l.incoming().flatten() {
                 let (st3, ak3) = (st2.clone(), ak.clone());
-                std::thread::spawn(move || serve(s, ak3, st3, interrupt_connections));
+                std::thread::spawn(move || serve(s, ak3, st3));
             }
         });
         (port, st, auth_key)
@@ -1795,23 +1697,12 @@ mod e2e_tests {
         pub secs: f64,
     }
 
+    /// Upload `parts` parts of `unit` bytes with `conns` workers and the given pacer settings.
     pub fn upload(port: u16, auth_key: &[u8], parts: usize, unit: u64, conns: usize, rate: f64, ceiling: f64) -> Out {
-        transfer(port, auth_key, parts, unit, conns, rate, ceiling, Mode::Upload)
-    }
-
-    fn transfer_path(port: u16, parts: usize) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!("cbcrypto-e2e-{}-{}-{}", port, parts, std::process::id()))
-    }
-
-    fn transfer(port: u16, auth_key: &[u8], parts: usize, unit: u64, conns: usize, rate: f64, ceiling: f64, mode: Mode) -> Out {
         let size = parts as u64 * unit;
-        let path = transfer_path(port, parts);
-        let file = if mode == Mode::Download {
-            File::create(&path).unwrap()
-        } else {
-            std::fs::write(&path, vec![7u8; size as usize]).unwrap();
-            File::open(&path).unwrap()
-        };
+        let path = std::env::temp_dir().join(format!("cbcrypto-e2e-{}-{}-{}", port, parts, std::process::id()));
+        std::fs::write(&path, vec![7u8; size as usize]).unwrap();
+        let file = File::open(&path).unwrap();
         let conn = ConnCfg {
             host: "127.0.0.1".into(),
             port,
@@ -1825,16 +1716,15 @@ mod e2e_tests {
         };
         let cfg = TransferCfg {
             conn,
-            mode,
+            mode: Mode::Upload,
             inflight: 4,
             max_reconnects: 5,
-            req_prefix: TEST_GET_FILE.to_le_bytes().to_vec(),
+            req_prefix: Vec::new(),
             file_id: 42,
             is_big: true,
             total_parts: parts as i32,
         };
-        let burst = if mode == Mode::Download { 1.0 } else { 8.0 };
-        let pc = PacerCfg { rate, burst, ceiling, step: 1.0, growth: 1.1, slow_start_cap: rate, hard_floor: 20.0, burst_credit: 0.0, sustain: 0.0 };
+        let pc = PacerCfg { rate, burst: 8.0, ceiling, step: 1.0, growth: 1.1, slow_start_cap: rate, hard_floor: 20.0, burst_credit: 0.0, sustain: 0.0 };
         let sh = Arc::new(Shared {
             cancel: AtomicBool::new(false),
             err: Mutex::new(None),
@@ -1844,7 +1734,7 @@ mod e2e_tests {
             next: AtomicUsize::new(0),
             total: parts,
             retry: Mutex::new(VecDeque::new()),
-            pacer: (rate > 0.0).then(|| make_pacer(&cfg, &pc)),
+            pacer: Some(make_pacer(&cfg, &pc)),
             flood_slept: Mutex::new(0.0),
             flood_events: Mutex::new(Vec::new()),
             floods: AtomicU64::new(0),
@@ -1882,55 +1772,11 @@ mod e2e_tests {
         o.sh.err.lock().unwrap().as_ref().map(|e| format!("{e:?}"))
     }
 
-    #[test]
-    fn download_writes_ready_chunk_before_waiting_for_next_send_permit() {
-        let (port, srv, key) = start_server(4, 100_000, false);
-        let (sent, received) = std::sync::mpsc::channel();
-        *srv.first_download_reply.lock().unwrap() = Some(sent);
-        // With a burst of one, the second request has to wait four seconds.
-        let worker = std::thread::spawn(move || transfer(port, &key, 2, 4096, 1, 0.25, 0.25, Mode::Download));
-        received.recv_timeout(Duration::from_secs(5)).unwrap();
-        let path = transfer_path(port, 2);
-        let deadline = Instant::now() + Duration::from_secs(2);
-        let mut first_chunk_ready = false;
-        while Instant::now() < deadline {
-            if std::fs::read(&path).is_ok_and(|data| data.len() == 4096 && data.iter().all(|&byte| byte == 7)) {
-                first_chunk_ready = true;
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        let out = worker.join().unwrap();
-        assert!(first_chunk_ready, "the first reply must be written before the next send permit");
-        assert!(failed(&out).is_none(), "transfer failed: {:?}", failed(&out));
-        assert_eq!(out.sh.done_bytes.load(Ordering::Relaxed), 2 * 4096);
-    }
-
-    #[test]
-    fn download_reduces_pipeline_after_repeated_peer_resets() {
-        let (port, srv, key) = start_server(5, 100_000, false);
-        srv.reject_download_pipeline.store(true, Ordering::Relaxed);
-        let out = transfer(port, &key, 4, 4096, 1, 0.0, 0.0, Mode::Download);
-        assert!(failed(&out).is_none(), "transfer failed: {:?}", failed(&out));
-        assert_eq!(out.sh.reconnects.load(Ordering::Relaxed), 2);
-        assert_eq!(out.sh.done_bytes.load(Ordering::Relaxed), 4 * 4096);
-    }
-
-    #[test]
-    fn upload_resends_all_unconfirmed_parts_after_connection_loss() {
-        let (port, srv, key) = start_server(3, 100_000, true);
-        let out = upload(port, &key, 8, 4096, 1, 100.0, 100.0);
-        assert!(failed(&out).is_none(), "transfer failed: {:?}", failed(&out));
-        assert_eq!(out.sh.reconnects.load(Ordering::Relaxed), 3);
-        assert_eq!(out.sh.done_bytes.load(Ordering::Relaxed), 8 * 4096);
-        assert_eq!(srv.parts.lock().unwrap().len(), 8);
-    }
-
     /// A pacer that asks for twice what the server allows: many floods, and the transfer must still
     /// deliver every part exactly once without being killed by the flood budget.
     #[test]
     fn a_flood_storm_does_not_kill_or_corrupt_the_transfer() {
-        let (port, srv, key) = start_server(1, 60, false);
+        let (port, srv, key) = start_server(1, 60);
         let o = upload(port, &key, 900, 4096, 8, 150.0, 200.0);
         let floods = srv.flood_replies.load(Ordering::SeqCst);
         eprintln!("storm: {:.1}s, flood replies {}, logged floods {}, slept {:.0}s, err {:?}",
@@ -1947,7 +1793,7 @@ mod e2e_tests {
     /// The next file reuses the connections the previous one finished with instead of dialling again.
     #[test]
     fn the_next_transfer_reuses_warm_connections() {
-        let (port, srv, key) = start_server(2, 100_000, false);
+        let (port, srv, key) = start_server(2, 100_000);
         let a = upload(port, &key, 200, 4096, 8, 400.0, 600.0);
         assert!(failed(&a).is_none());
         let after_first = srv.accepted.load(Ordering::SeqCst);
