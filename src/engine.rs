@@ -647,9 +647,154 @@ fn pool_take(cfg: &ConnCfg) -> Option<Conn> {
     }
 }
 
+
+// ------------------------------------------------------------------ streaming gate
+
+struct GateState {
+    done: Vec<bool>,
+    next: usize,
+    start: u64,
+    unit: u64,
+    size: u64,
+}
+
+/// In-memory mode: finished chunks wait here (keyed by absolute chunk number) until Python takes
+/// them, in order. The gate window bounds how many there can ever be.
+struct MemState {
+    map: std::collections::HashMap<u64, Vec<u8>>,
+    next_abs: u64,
+    inited: bool,
+}
+
+/// Shared between the engine and a Python reader that wants the file *while it downloads*:
+/// the engine publishes how much of the file is contiguous on disk (`watermark`), the reader says
+/// how far it has consumed (`consumed`) so the engine never runs more than `window` bytes ahead.
+struct Gate {
+    window: AtomicU64,
+    consumed: AtomicU64,
+    watermark: AtomicU64,
+    cancel: AtomicBool,
+    mem: bool,
+    chunks: Mutex<MemState>,
+    st: Mutex<GateState>,
+}
+
+impl Gate {
+    fn init(&self, start: u64, unit: u64, size: u64, units: usize) {
+        let mut g = self.st.lock().unwrap();
+        *g = GateState { done: vec![false; units], next: 0, start, unit, size };
+        self.watermark.store(start, Ordering::Release);
+        self.consumed.fetch_max(start, Ordering::AcqRel);
+        if self.mem {
+            let mut m = self.chunks.lock().unwrap();
+            if !m.inited {
+                m.inited = true;
+                m.next_abs = start / unit;
+            }
+        }
+    }
+
+    fn put(&self, abs_chunk: u64, data: Vec<u8>) {
+        self.chunks.lock().unwrap().map.insert(abs_chunk, data);
+    }
+
+    /// chunk `idx` (counted from the transfer start) is on disk: advance the contiguous watermark
+    fn mark(&self, idx: usize) {
+        let mut g = self.st.lock().unwrap();
+        if idx < g.done.len() {
+            g.done[idx] = true;
+        }
+        let mut n = g.next;
+        while n < g.done.len() && g.done[n] {
+            n += 1;
+        }
+        if n != g.next {
+            g.next = n;
+            let wm = (g.start + n as u64 * g.unit).min(g.size);
+            self.watermark.store(wm, Ordering::Release);
+        }
+    }
+
+    /// may the chunk starting at absolute offset `off` be requested yet?
+    fn allows(&self, off: u64) -> bool {
+        let w = self.window.load(Ordering::Relaxed);
+        w == 0 || off < self.consumed.load(Ordering::Acquire).saturating_add(w)
+    }
+}
+
+/// Handle for streaming a download: `StreamCtl(window_bytes)` is passed to `download(stream=...)`.
+#[pyclass]
+pub struct StreamCtl {
+    inner: Arc<Gate>,
+}
+
+#[pymethods]
+impl StreamCtl {
+    #[new]
+    #[pyo3(signature = (window_bytes=67108864, memory=false))]
+    fn new(window_bytes: u64, memory: bool) -> Self {
+        StreamCtl {
+            inner: Arc::new(Gate {
+                window: AtomicU64::new(window_bytes),
+                consumed: AtomicU64::new(0),
+                watermark: AtomicU64::new(0),
+                cancel: AtomicBool::new(false),
+                mem: memory,
+                chunks: Mutex::new(MemState { map: std::collections::HashMap::new(), next_abs: 0, inited: false }),
+                st: Mutex::new(GateState { done: Vec::new(), next: 0, start: 0, unit: 1, size: 0 }),
+            }),
+        }
+    }
+    /// absolute file offset: every byte below it is on disk (contiguous from the start offset)
+    fn watermark(&self) -> u64 {
+        self.inner.watermark.load(Ordering::Acquire)
+    }
+    /// tell the engine the reader is at this absolute offset (never moves backwards)
+    fn consumed(&self, offset: u64) {
+        self.inner.consumed.fetch_max(offset, Ordering::AcqRel);
+    }
+    fn set_window(&self, window_bytes: u64) {
+        self.inner.window.store(window_bytes, Ordering::Relaxed);
+    }
+    fn cancel(&self) {
+        self.inner.cancel.store(true, Ordering::SeqCst);
+    }
+    fn cancelled(&self) -> bool {
+        self.inner.cancel.load(Ordering::SeqCst)
+    }
+    /// In-memory mode: the next finished chunks, in order and without gaps (at most `max_chunks`).
+    /// Taking them is what lets the engine fetch further: memory never exceeds window + requests in flight.
+    #[pyo3(signature = (max_chunks=8))]
+    fn pop_ready<'py>(&self, py: Python<'py>, max_chunks: usize) -> Bound<'py, pyo3::types::PyList> {
+        let g = &self.inner;
+        let out = pyo3::types::PyList::empty_bound(py);
+        let (unit, size) = {
+            let st = g.st.lock().unwrap();
+            (st.unit.max(1), st.size)
+        };
+        let mut m = g.chunks.lock().unwrap();
+        while out.len() < max_chunks {
+            let k = m.next_abs;
+            let Some(v) = m.map.remove(&k) else { break };
+            let _ = out.append(pyo3::types::PyBytes::new_bound(py, &v));
+            m.next_abs += 1;
+        }
+        let at = (m.next_abs * unit).min(size);
+        drop(m);
+        g.consumed.fetch_max(at, Ordering::AcqRel);
+        out
+    }
+    /// bytes finished but not yet taken (in-memory mode): what the stream is holding in RAM
+    fn buffered(&self) -> u64 {
+        let m = self.inner.chunks.lock().unwrap();
+        m.map.values().map(|v| v.len() as u64).sum()
+    }
+}
+
 // ------------------------------------------------------------------ shared transfer state
 
 struct Shared {
+    gate: Option<Arc<Gate>>,
     cancel: AtomicBool,
     err: Mutex<Option<EngineError>>,
     last_err: Mutex<Option<EngineError>>,
@@ -705,8 +850,27 @@ impl Shared {
         if let Some(i) = self.retry.lock().unwrap().pop_front() {
             return Some(i);
         }
-        let i = self.next.fetch_add(1, Ordering::SeqCst);
-        (i < self.total).then_some(i)
+        let Some(g) = &self.gate else {
+            let i = self.next.fetch_add(1, Ordering::SeqCst);
+            return (i < self.total).then_some(i);
+        };
+        // streaming: never run more than `window` bytes ahead of the reader
+        loop {
+            let i = self.next.load(Ordering::SeqCst);
+            if i >= self.total || !g.allows(self.start + i as u64 * self.unit) {
+                return None;
+            }
+            if self.next.compare_exchange(i, i + 1, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+                return Some(i);
+            }
+        }
+    }
+
+    /// true while the reader, not the network, is what the engine is waiting for
+    fn throttled(&self) -> bool {
+        let Some(g) = &self.gate else { return false };
+        let i = self.next.load(Ordering::SeqCst);
+        i < self.total && !g.allows(self.start + i as u64 * self.unit)
     }
 
     fn requeue(&self, i: usize) {
@@ -839,6 +1003,9 @@ fn run_session(sh: &Shared, cfg: &TransferCfg, c: &mut Conn, inflight: &mut Hash
             if sh.completed.load(Ordering::SeqCst) >= sh.remaining {
                 return Ok(());
             }
+            if sh.throttled() {
+                *sh.last_progress.lock().unwrap() = Instant::now(); // a paused reader is not a stalled transfer
+            }
             if sh.last_progress.lock().unwrap().elapsed() > sh.stall_limit {
                 return Err(EngineError::Protocol(format!(
                     "transfer stalled: {} of {} chunks done, none in flight",
@@ -863,8 +1030,14 @@ fn run_session(sh: &Shared, cfg: &TransferCfg, c: &mut Conn, inflight: &mut Hash
                             fatal = Some(EngineError::Protocol(format!("short chunk: got {} of {} bytes at offset {}", data.len(), expect, off)));
                             return Ok(());
                         }
-                        write_all_at(&sh.file, &data[..expect], off).map_err(ioerr)?;
+                        match &sh.gate {
+                            Some(g) if g.mem => g.put(off / sh.unit, data[..expect].to_vec()),
+                            _ => write_all_at(&sh.file, &data[..expect], off).map_err(ioerr)?,
+                        }
                         sh.done_bytes.fetch_add(expect as u64, Ordering::Relaxed);
+                        if let Some(g) = &sh.gate {
+                            g.mark(idx);
+                        }
                         { sh.completed.fetch_add(1, Ordering::SeqCst); *sh.last_progress.lock().unwrap() = Instant::now(); }
                         if let Some(p) = &sh.pacer {
                             p.on_success();
@@ -1141,8 +1314,14 @@ fn run_transfer(
     progress: Option<PyObject>,
     stats: Option<Py<pyo3::types::PyDict>>,
     on_flood: Option<PyObject>,
+    gate: Option<Arc<Gate>>,
 ) -> PyResult<u64> {
+    if let Some(g) = &gate {
+        g.init(start, unit, size, total_units.saturating_sub(first_unit));
+    }
+    let tick = Duration::from_millis(if gate.is_some() { 4 } else { 40 });
     let sh = Arc::new(Shared {
+        gate: gate.clone(),
         cancel: AtomicBool::new(false),
         err: Mutex::new(None),
         last_err: Mutex::new(None),
@@ -1182,14 +1361,29 @@ fn run_transfer(
 
     let mut last_reported = u64::MAX;
     let mut py_err: Option<PyErr> = None;
+    let mut gate_cancelled = false;
     loop {
-        py.allow_threads(|| std::thread::sleep(Duration::from_millis(40)));
+        py.allow_threads(|| std::thread::sleep(tick));
         if let Err(e) = py.check_signals() {
             py_err = Some(e);
             sh.cancel.store(true, Ordering::SeqCst);
             break;
         }
+        if let Some(g) = &gate {
+            if g.cancel.load(Ordering::SeqCst) {
+                gate_cancelled = true;
+                sh.cancel.store(true, Ordering::SeqCst);
+                break;
+            }
+        }
         let done = sh.done_bytes.load(Ordering::Relaxed);
+        // when streaming, wake Python only when something new landed (it is also woken by cancel via the gate)
+        if gate.is_some() && done == last_reported {
+            if sh.active.load(Ordering::SeqCst) == 0 {
+                break;
+            }
+            continue;
+        }
         if let Some(cb) = &progress {
             // every tick, even without new bytes: this is also how Python gets to cancel a stalled transfer
             last_reported = done;
@@ -1236,6 +1430,9 @@ fn run_transfer(
     if let Some(e) = py_err {
         return Err(e);
     }
+    if gate_cancelled {
+        return Err(to_pyerr(EngineError::Cancelled));
+    }
     let done = sh.done_bytes.load(Ordering::Relaxed);
     if let Some(cb) = &progress {
         if done != last_reported {
@@ -1268,7 +1465,7 @@ fn pacer_cfg(paced: bool, rate: f64, burst: f64, ceiling: f64, step: f64, growth
                     start_offset=0, chunk_size=1048576, connections=5, inflight=3, paced=true,
                     rate=8.0, burst=8.0, ceiling=150.0, step=0.5, growth=1.5, slow_start_cap=40.0,
                     progress=None, time_offset=0.0, recv_buffer=0, read_timeout=30.0,
-                    flood_each_cap=30.0, flood_total_cap=300.0, max_reconnects=5, floor=1.0, stats=None, on_flood=None, burst_credit=0.0, sustain=0.0))]
+                    flood_each_cap=30.0, flood_total_cap=300.0, max_reconnects=5, floor=1.0, stats=None, on_flood=None, burst_credit=0.0, sustain=0.0, stream=None))]
 #[allow(clippy::too_many_arguments)]
 fn download(
     py: Python<'_>,
@@ -1304,8 +1501,10 @@ fn download(
     on_flood: Option<PyObject>,
     burst_credit: f64,
     sustain: f64,
+    stream: Option<PyRef<'_, StreamCtl>>,
 ) -> PyResult<u64> {
     check_common(&auth_key, &auth_key_id, chunk_size)?;
+    let gate = stream.map(|s| s.inner.clone());
     if start_offset % chunk_size != 0 || start_offset >= file_size {
         return Err(pyo3::exceptions::PyValueError::new_err("start_offset must be chunk aligned and inside the file"));
     }
@@ -1327,7 +1526,7 @@ fn download(
     run_transfer(
         py, cfg, file, file_size, chunk_size, start_offset, total, 0, connections,
         pacer_cfg(paced, rate, burst, ceiling, step, growth, slow_start_cap, floor, burst_credit, sustain),
-        flood_each_cap, flood_total_cap, progress, stats, on_flood,
+        flood_each_cap, flood_total_cap, progress, stats, on_flood, gate,
     )
 }
 
@@ -1396,7 +1595,7 @@ fn upload(
     run_transfer(
         py, cfg, file, file_size, part_size, 0, total_parts, start_part, connections,
         pacer_cfg(paced, rate, burst, ceiling, step, growth, slow_start_cap, floor, burst_credit, sustain),
-        flood_each_cap, flood_total_cap, progress, stats, on_flood,
+        flood_each_cap, flood_total_cap, progress, stats, on_flood, None,
     )
 }
 
@@ -1423,6 +1622,7 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(download, m)?)?;
     m.add_function(wrap_pyfunction!(upload, m)?)?;
     m.add_function(wrap_pyfunction!(_constants, m)?)?;
+    m.add_class::<StreamCtl>()?;
     m.add("CoreError", m.py().get_type_bound::<CoreError>())?;
     Ok(())
         }
@@ -1548,6 +1748,7 @@ mod e2e_tests {
         pub accepted: AU,
         pub parts: Mutex<HashSet<i32>>,
         pub flood_replies: AU,
+        pub gets: AU,
         window: Mutex<VecDeque<Instant>>,
         penalty: Mutex<Option<Instant>>,
     }
@@ -1628,6 +1829,23 @@ mod e2e_tests {
             let msg_id = i64::from_le_bytes(plain[16..24].try_into().unwrap());
             let len = u32::from_le_bytes(plain[28..32].try_into().unwrap()) as usize;
             let body = &plain[32..32 + len];
+            if body.len() == 16 && u32::from_le_bytes(body[0..4].try_into().unwrap()) == 0xbe5335be {
+                // upload.getFile: ctor, offset:long, limit:int. File content is byte i = (i % 251)
+                let off = i64::from_le_bytes(body[4..12].try_into().unwrap()) as u64;
+                let lim = i32::from_le_bytes(body[12..16].try_into().unwrap()) as usize;
+                st.gets.fetch_add(1, Ordering::SeqCst);
+                let data: Vec<u8> = (0..lim as u64).map(|i| ((off + i) % 251) as u8).collect();
+                let mut reply = Vec::new();
+                reply.extend_from_slice(&RPC_RESULT.to_le_bytes());
+                reply.extend_from_slice(&msg_id.to_le_bytes());
+                reply.extend_from_slice(&UPLOAD_FILE.to_le_bytes());
+                reply.extend_from_slice(&0x007efe0eu32.to_le_bytes());
+                reply.extend_from_slice(&0i32.to_le_bytes());
+                tl_bytes_put(&mut reply, &data);
+                counter += 1;
+                srv_send(&mut s, &mut tx, &auth_key, &session_id, 0x6000_0000_0000_0000 + counter * 4 + 1, &reply);
+                continue;
+            }
             if body.len() < 20 || u32::from_le_bytes(body[0..4].try_into().unwrap()) != SAVE_BIG_FILE_PART {
                 continue; // an ack
             }
@@ -1679,6 +1897,7 @@ mod e2e_tests {
             accepted: AU::new(0),
             parts: Mutex::new(HashSet::new()),
             flood_replies: AU::new(0),
+            gets: AU::new(0),
             window: Mutex::new(VecDeque::new()),
             penalty: Mutex::new(None),
         });
@@ -1726,6 +1945,7 @@ mod e2e_tests {
         };
         let pc = PacerCfg { rate, burst: 8.0, ceiling, step: 1.0, growth: 1.1, slow_start_cap: rate, hard_floor: 20.0, burst_credit: 0.0, sustain: 0.0 };
         let sh = Arc::new(Shared {
+            gate: None,
             cancel: AtomicBool::new(false),
             err: Mutex::new(None),
             last_err: Mutex::new(None),
@@ -1770,6 +1990,165 @@ mod e2e_tests {
 
     pub fn failed(o: &Out) -> Option<String> {
         o.sh.err.lock().unwrap().as_ref().map(|e| format!("{e:?}"))
+    }
+
+
+    /// Download `size` bytes (unit-sized chunks) from `start`, streaming: returns the Shared state and the gate.
+    fn stream_setup(port: u16, auth_key: &[u8], size: u64, unit: u64, start: u64, window: u64, path: &std::path::Path, mem: bool)
+        -> (Arc<Shared>, Arc<Gate>, TransferCfg)
+    {
+        let f = std::fs::OpenOptions::new().write(true).create(true).open(path).unwrap();
+        f.set_len(size).unwrap();
+        let conn = ConnCfg {
+            host: "127.0.0.1".into(), port, auth_key: auth_key.to_vec(), auth_key_id: auth_key[..8].to_vec(),
+            salt: 0, init_prefix: Vec::new(), time_offset: 0.0, recv_buf: 0, read_timeout: Duration::from_secs(10),
+        };
+        let cfg = TransferCfg {
+            conn, mode: Mode::Download, inflight: 3, max_reconnects: 5,
+            req_prefix: 0xbe5335beu32.to_le_bytes().to_vec(), file_id: 0, is_big: false, total_parts: 0,
+        };
+        let total = ((size - start).div_ceil(unit)) as usize;
+        let gate = Arc::new(Gate {
+            window: AtomicU64::new(window), consumed: AtomicU64::new(0), watermark: AtomicU64::new(0),
+            cancel: AtomicBool::new(false),
+            mem,
+            chunks: Mutex::new(MemState { map: std::collections::HashMap::new(), next_abs: 0, inited: false }),
+            st: Mutex::new(GateState { done: Vec::new(), next: 0, start: 0, unit: 1, size: 0 }),
+        });
+        gate.init(start, unit, size, total);
+        let sh = Arc::new(Shared {
+            gate: Some(gate.clone()), cancel: AtomicBool::new(false), err: Mutex::new(None), last_err: Mutex::new(None),
+            done_bytes: AtomicU64::new(0), active: AtomicUsize::new(2), next: AtomicUsize::new(0), total,
+            retry: Mutex::new(VecDeque::new()), pacer: None, flood_slept: Mutex::new(0.0),
+            flood_events: Mutex::new(Vec::new()), floods: AtomicU64::new(0), flood_ms: AtomicU64::new(0),
+            flood_max_ms: AtomicU64::new(0), reconnects: AtomicU64::new(0), timeouts: AtomicU64::new(0),
+            server_errs: AtomicUsize::new(0), completed: AtomicUsize::new(0), remaining: total,
+            last_progress: Mutex::new(Instant::now()), stall_limit: Duration::from_secs(60),
+            flood_total_cap: 300.0, flood_each_cap: 30.0, file: f, size, unit, start,
+        });
+        (sh, gate, cfg)
+    }
+
+    /// The engine must not run more than `window` bytes ahead of the reader, must publish a
+    /// contiguous watermark, and must finish once the reader keeps consuming.
+    #[test]
+    fn streaming_download_is_gated_by_the_reader_and_publishes_a_watermark() {
+        let (port, srv, key) = start_server(3, 100_000);
+        let (size, unit) = (64 * 4096u64, 4096u64);
+        let path = std::env::temp_dir().join(format!("cbcrypto-stream-{}-{}", port, std::process::id()));
+        let (sh, gate, cfg) = stream_setup(port, &key, size, unit, 0, 8 * unit, &path, false);
+        let hs: Vec<_> = (0..2).map(|_| { let (s, c) = (sh.clone(), cfg.clone()); std::thread::spawn(move || worker(s, c)) }).collect();
+
+        // reader idle: the engine may fetch the window (8 chunks) and not a byte more
+        std::thread::sleep(Duration::from_millis(700));
+        let asked = srv.gets.load(Ordering::SeqCst);
+        assert_eq!(asked, 8, "only the window may be requested while the reader is idle, got {asked}");
+        assert_eq!(gate.watermark.load(Ordering::SeqCst), 8 * unit, "the 8 chunks are contiguous on disk");
+        assert!(sh.err.lock().unwrap().is_none());
+
+        // reader consumes everything, in steps: the rest arrives
+        let rd = File::open(&path).unwrap();
+        let mut pos = 0u64;
+        let t0 = Instant::now();
+        while pos < size {
+            assert!(t0.elapsed() < Duration::from_secs(20), "stream stalled at {pos}");
+            let wm = gate.watermark.load(Ordering::Acquire);
+            if wm > pos {
+                let mut buf = vec![0u8; (wm - pos) as usize];
+                read_exact_at(&rd, &mut buf, pos).unwrap();
+                for (i, b) in buf.iter().enumerate() {
+                    assert_eq!(*b, ((pos + i as u64) % 251) as u8, "byte {} is wrong", pos + i as u64);
+                }
+                pos = wm;
+                gate.consumed.fetch_max(pos, Ordering::AcqRel);
+            } else {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+        for h in hs { h.join().unwrap(); }
+        assert!(sh.err.lock().unwrap().is_none(), "{:?}", sh.err.lock().unwrap());
+        assert_eq!(sh.done_bytes.load(Ordering::SeqCst), size);
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// A seek: the transfer starts in the middle of the file and its watermark starts there too.
+    #[test]
+    fn streaming_download_can_start_at_an_offset() {
+        let (port, srv, key) = start_server(4, 100_000);
+        let (size, unit, start) = (40 * 4096u64, 4096u64, 25 * 4096u64);
+        let path = std::env::temp_dir().join(format!("cbcrypto-seek-{}-{}", port, std::process::id()));
+        let (sh, gate, cfg) = stream_setup(port, &key, size, unit, start, 0, &path, false); // window 0 = unlimited
+        assert_eq!(gate.watermark.load(Ordering::SeqCst), start);
+        let hs: Vec<_> = (0..2).map(|_| { let (s, c) = (sh.clone(), cfg.clone()); std::thread::spawn(move || worker(s, c)) }).collect();
+        for h in hs { h.join().unwrap(); }
+        assert!(sh.err.lock().unwrap().is_none());
+        assert_eq!(srv.gets.load(Ordering::SeqCst), 15, "only chunks from the seek point on");
+        assert_eq!(gate.watermark.load(Ordering::SeqCst), size);
+        let _ = std::fs::remove_file(path);
+    }
+
+
+    /// In-memory mode: nothing is written to the file, chunks come out in order through `pop_ready`'s
+    /// backing map, and RAM stays bounded by the window while the reader is idle.
+    #[test]
+    fn memory_streaming_holds_at_most_the_window_and_delivers_in_order() {
+        let (port, srv, key) = start_server(5, 100_000);
+        let (size, unit) = (40 * 4096u64 + 100, 4096u64);
+        let path = std::env::temp_dir().join(format!("cbcrypto-mem-{}-{}", port, std::process::id()));
+        let (sh, gate, cfg) = stream_setup(port, &key, size, unit, 0, 6 * unit, &path, true);
+        let hs: Vec<_> = (0..2).map(|_| { let (s, c) = (sh.clone(), cfg.clone()); std::thread::spawn(move || worker(s, c)) }).collect();
+        std::thread::sleep(Duration::from_millis(600));
+        assert_eq!(srv.gets.load(Ordering::SeqCst), 6, "idle reader: only the window is fetched");
+        assert_eq!(gate.chunks.lock().unwrap().map.len(), 6, "and it sits in RAM, nowhere else");
+        assert!(std::fs::read(&path).unwrap().iter().all(|b| *b == 0), "nothing was written to the file");
+
+        let mut got: Vec<u8> = Vec::new();
+        let t0 = Instant::now();
+        while (got.len() as u64) < size {
+            assert!(t0.elapsed() < Duration::from_secs(20), "stalled at {}", got.len());
+            let mut m = gate.chunks.lock().unwrap();
+            let mut popped = false;
+            loop {
+                let k = m.next_abs;
+                let Some(v) = m.map.remove(&k) else { break };
+                got.extend_from_slice(&v);
+                m.next_abs += 1;
+                popped = true;
+            }
+            let at = (m.next_abs * unit).min(size);
+            drop(m);
+            gate.consumed.fetch_max(at, Ordering::AcqRel);
+            if !popped { std::thread::sleep(Duration::from_millis(2)); }
+        }
+        for h in hs { h.join().unwrap(); }
+        assert!(sh.err.lock().unwrap().is_none());
+        assert_eq!(got.len() as u64, size);
+        for (i, b) in got.iter().enumerate() {
+            assert_eq!(*b, (i as u64 % 251) as u8, "byte {i}");
+        }
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn gate_watermark_only_advances_over_contiguous_chunks() {
+        let g = Gate {
+            window: AtomicU64::new(0), consumed: AtomicU64::new(0), watermark: AtomicU64::new(0),
+            cancel: AtomicBool::new(false),
+            mem: false,
+            chunks: Mutex::new(MemState { map: std::collections::HashMap::new(), next_abs: 0, inited: false }),
+            st: Mutex::new(GateState { done: Vec::new(), next: 0, start: 0, unit: 1, size: 0 }),
+        };
+        g.init(1000, 100, 1450, 5); // chunks at 1000,1100,1200,1300,1400(50 bytes)
+        assert_eq!(g.watermark.load(Ordering::SeqCst), 1000);
+        g.mark(2);
+        assert_eq!(g.watermark.load(Ordering::SeqCst), 1000, "a hole at chunk 0 blocks the watermark");
+        g.mark(0);
+        assert_eq!(g.watermark.load(Ordering::SeqCst), 1100);
+        g.mark(1);
+        assert_eq!(g.watermark.load(Ordering::SeqCst), 1300);
+        g.mark(4);
+        g.mark(3);
+        assert_eq!(g.watermark.load(Ordering::SeqCst), 1450, "capped at the file size");
     }
 
     /// A pacer that asks for twice what the server allows: many floods, and the transfer must still
