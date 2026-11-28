@@ -793,7 +793,93 @@ impl StreamCtl {
 
 // ------------------------------------------------------------------ shared transfer state
 
+/// Closed-loop connection control for downloads.
+///
+/// A rate limit alone is open-loop: it keeps asking for the same amount while Telegram is already
+/// refusing, and every refusal tends to end in a reset socket. Here a flood or a lost connection
+/// *takes a connection out of service* (its in-flight chunks drain, it stays dialled but sends
+/// nothing), so the number of requests outstanding at the server falls right away. After a quiet
+/// period one connection at a time is let back in. Workers are also started one after another
+/// (`ramp`) instead of all in the same instant, so a transfer never opens with N sessions each
+/// sending their first request together.
+///
+/// CBCRYPTO_SHED=0 turns this off; CBCRYPTO_MIN_CONNS (default 2), CBCRYPTO_REGROW_SECS (default 20)
+/// and CBCRYPTO_RAMP_MS (default 150) tune it. Uploads never use it.
+struct Shed {
+    enabled: bool,
+    configured: usize,
+    allowed: AtomicUsize,
+    min_allowed: usize,
+    regrow: Duration,
+    ramp: Duration,
+    last_event: Mutex<Instant>,
+    events: AtomicU64,
+    next_id: AtomicUsize,
+}
+
+impl Shed {
+    fn new(enabled: bool, connections: usize) -> Shed {
+        let env_num = |k: &str, d: f64| std::env::var(k).ok().and_then(|v| v.parse::<f64>().ok()).unwrap_or(d);
+        let enabled = enabled && std::env::var("CBCRYPTO_SHED").map_or(true, |v| v != "0");
+        let n = connections.max(1);
+        Shed {
+            enabled,
+            configured: n,
+            allowed: AtomicUsize::new(n),
+            min_allowed: (env_num("CBCRYPTO_MIN_CONNS", 2.0) as usize).clamp(1, n),
+            regrow: Duration::from_secs_f64(env_num("CBCRYPTO_REGROW_SECS", 20.0).max(1.0)),
+            ramp: Duration::from_millis(if enabled { env_num("CBCRYPTO_RAMP_MS", 150.0).max(0.0) as u64 } else { 0 }),
+            last_event: Mutex::new(Instant::now()),
+            events: AtomicU64::new(0),
+            next_id: AtomicUsize::new(0),
+        }
+    }
+
+    fn off() -> Shed {
+        Shed::new(false, 1)
+    }
+
+    fn next_id(&self) -> usize {
+        self.next_id.fetch_add(1, Ordering::SeqCst)
+    }
+
+    /// true when worker `wid` is currently out of service
+    fn parked(&self, wid: usize) -> bool {
+        self.enabled && wid >= self.allowed.load(Ordering::Relaxed)
+    }
+
+    /// Telegram refused us or dropped a socket: one connection fewer for a while.
+    fn shed(&self) {
+        if !self.enabled {
+            return;
+        }
+        let a = self.allowed.load(Ordering::Relaxed);
+        if a > self.min_allowed {
+            self.allowed.store(a - 1, Ordering::Relaxed);
+            self.events.fetch_add(1, Ordering::Relaxed);
+        }
+        *self.last_event.lock().unwrap() = Instant::now();
+    }
+
+    /// Quiet for `regrow`: let one connection back in.
+    fn tick(&self) {
+        if !self.enabled || self.allowed.load(Ordering::Relaxed) >= self.configured {
+            return;
+        }
+        let mut last = self.last_event.lock().unwrap();
+        if last.elapsed() >= self.regrow {
+            self.allowed.fetch_add(1, Ordering::Relaxed);
+            *last = Instant::now();
+        }
+    }
+
+    fn current(&self) -> usize {
+        if self.enabled { self.allowed.load(Ordering::Relaxed).min(self.configured) } else { self.configured }
+    }
+}
+
 struct Shared {
+    shed: Shed,
     gate: Option<Arc<Gate>>,
     cancel: AtomicBool,
     err: Mutex<Option<EngineError>>,
@@ -967,16 +1053,18 @@ fn send_chunk(sh: &Shared, cfg: &TransferCfg, c: &mut Conn, idx: usize) -> Res<i
 }
 
 /// One connected session's work loop. Returns Ok when there is nothing left to do.
-fn run_session(sh: &Shared, cfg: &TransferCfg, c: &mut Conn, inflight: &mut HashMap<i64, usize>) -> Res<()> {
+fn run_session(sh: &Shared, cfg: &TransferCfg, c: &mut Conn, inflight: &mut HashMap<i64, usize>, wid: usize) -> Res<()> {
     loop {
         if sh.cancel.load(Ordering::Relaxed) {
             return Err(EngineError::Cancelled);
         }
+        sh.shed.tick();
         // fill the pipeline, but only with this connection's fair share of what is still unassigned:
         // otherwise the first connection to come up takes `inflight` chunks of a small file all by
         // itself (4 chunks = 3 serial on one connection) and the other connections sit idle, and at
         // the end of a transfer one connection is left with the whole tail
-        let window = cfg.inflight.min(sh.fair_share());
+        // a connection that was taken out of service (see `Shed`) finishes what it has and takes no more
+        let window = if sh.shed.parked(wid) { 0 } else { cfg.inflight.min(sh.fair_share()) };
         while inflight.len() < window {
             let Some(idx) = sh.take() else { break };
             if let Some(p) = &sh.pacer {
@@ -1012,6 +1100,9 @@ fn run_session(sh: &Shared, cfg: &TransferCfg, c: &mut Conn, inflight: &mut Hash
                     sh.completed.load(Ordering::SeqCst), sh.remaining
                 )));
             }
+            // idle (parked, or waiting for the reader): still acknowledge what the server sent, or it
+            // keeps resending it and eventually closes the connection
+            c.flush_acks(false)?;
             std::thread::sleep(Duration::from_millis(15));
             continue;
         }
@@ -1078,6 +1169,7 @@ fn run_session(sh: &Shared, cfg: &TransferCfg, c: &mut Conn, inflight: &mut Hash
                                     if fresh {
                                         *slept += secs;
                                         sh.flood_events.lock().unwrap().push(secs);
+                                        sh.shed.shed();
                                     }
                                     sh.floods.fetch_add(1, Ordering::Relaxed);
                                     sh.flood_ms.fetch_add((secs * 1000.0) as u64, Ordering::Relaxed);
@@ -1130,6 +1222,10 @@ fn run_session(sh: &Shared, cfg: &TransferCfg, c: &mut Conn, inflight: &mut Hash
         }
         let mut acts: VecDeque<Act> = acts.into();
         while let Some(Act(idx, secs)) = acts.pop_front() {
+            if sh.shed.parked(wid) {
+                sh.requeue(idx); // someone still in service takes it
+                continue;
+            }
             let step = (|| -> Res<()> {
                 if secs > 0.0 && !sh.sleep_cancellable(secs) {
                     return Err(EngineError::Cancelled);
@@ -1177,9 +1273,18 @@ fn worker(sh: Arc<Shared>, cfg: TransferCfg) {
     let mut inflight: HashMap<i64, usize> = HashMap::new();
     let mut failures = 0u32;
     let mut clean = false;
+    let wid = sh.shed.next_id();
+    // bring connections in one after another: the server sees the load grow instead of N first
+    // requests in the same instant
+    if wid > 0 && sh.shed.ramp > Duration::ZERO {
+        let _ = sh.sleep_cancellable(sh.shed.ramp.as_secs_f64() * wid as f64);
+    }
     loop {
         if sh.cancel.load(Ordering::Relaxed) {
             break;
+        }
+        if conn.is_none() && sh.completed.load(Ordering::SeqCst) >= sh.remaining {
+            break; // everything finished while this worker was waiting its turn: nothing to dial for
         }
         if conn.is_none() {
             // first connection of this worker: reuse a warm one if there is one. After an error the
@@ -1206,7 +1311,7 @@ fn worker(sh: Arc<Shared>, cfg: TransferCfg) {
         }
         let c = conn.as_mut().unwrap();
         let done_before = sh.completed.load(Ordering::Relaxed);
-        let result = run_session(&sh, &cfg, c, &mut inflight);
+        let result = run_session(&sh, &cfg, c, &mut inflight, wid);
         // a connection that moved data before it broke is a healthy one: the budget is for consecutive
         // failures, not for every reset over the life of a multi-GB transfer
         if sh.completed.load(Ordering::Relaxed) > done_before {
@@ -1222,6 +1327,7 @@ fn worker(sh: Arc<Shared>, cfg: TransferCfg) {
             }
             Err(e @ (EngineError::Io(_) | EngineError::Timeout(_))) => {
                 sh.reconnects.fetch_add(1, Ordering::Relaxed);
+                sh.shed.shed();
                 if matches!(e, EngineError::Timeout(_)) {
                     sh.timeouts.fetch_add(1, Ordering::Relaxed);
                 }
@@ -1321,6 +1427,7 @@ fn run_transfer(
     }
     let tick = Duration::from_millis(if gate.is_some() { 4 } else { 40 });
     let sh = Arc::new(Shared {
+        shed: Shed::new(cfg.mode == Mode::Download, connections.max(1).min(total_units.saturating_sub(first_unit).max(1))),
         gate: gate.clone(),
         cancel: AtomicBool::new(false),
         err: Mutex::new(None),
@@ -1423,6 +1530,8 @@ fn run_transfer(
         let _ = d.set_item("reconnects", sh.reconnects.load(Ordering::Relaxed));
         let _ = d.set_item("timeouts", sh.timeouts.load(Ordering::Relaxed));
         let _ = d.set_item("server_errors", sh.server_errs.load(Ordering::Relaxed));
+        let _ = d.set_item("sheds", sh.shed.events.load(Ordering::Relaxed));
+        let _ = d.set_item("conns_end", sh.shed.current());
         if let Some(p) = &sh.pacer {
             let _ = d.set_item("pace_end", p.rate());
         }
@@ -1749,6 +1858,7 @@ mod e2e_tests {
         pub parts: Mutex<HashSet<i32>>,
         pub flood_replies: AU,
         pub gets: AU,
+        pub flood_gets: AU,
         window: Mutex<VecDeque<Instant>>,
         penalty: Mutex<Option<Instant>>,
     }
@@ -1834,6 +1944,37 @@ mod e2e_tests {
                 let off = i64::from_le_bytes(body[4..12].try_into().unwrap()) as u64;
                 let lim = i32::from_le_bytes(body[12..16].try_into().unwrap()) as usize;
                 st.gets.fetch_add(1, Ordering::SeqCst);
+                if st.flood_gets.load(Ordering::SeqCst) != 0 {
+                    let now = Instant::now();
+                    let flood = {
+                        let mut pen = st.penalty.lock().unwrap();
+                        let mut w = st.window.lock().unwrap();
+                        while w.front().map_or(false, |t| now.duration_since(*t) > Duration::from_secs(1)) {
+                            w.pop_front();
+                        }
+                        if pen.map_or(false, |t| now < t) {
+                            true
+                        } else if w.len() >= st.limit {
+                            *pen = Some(now + Duration::from_secs(1));
+                            true
+                        } else {
+                            w.push_back(now);
+                            false
+                        }
+                    };
+                    if flood {
+                        st.flood_replies.fetch_add(1, Ordering::SeqCst);
+                        let mut reply = Vec::new();
+                        reply.extend_from_slice(&RPC_RESULT.to_le_bytes());
+                        reply.extend_from_slice(&msg_id.to_le_bytes());
+                        reply.extend_from_slice(&RPC_ERROR.to_le_bytes());
+                        reply.extend_from_slice(&420i32.to_le_bytes());
+                        tl_str(&mut reply, "FLOOD_WAIT_1");
+                        counter += 1;
+                        srv_send(&mut s, &mut tx, &auth_key, &session_id, 0x6000_0000_0000_0000 + counter * 4 + 1, &reply);
+                        continue;
+                    }
+                }
                 let data: Vec<u8> = (0..lim as u64).map(|i| ((off + i) % 251) as u8).collect();
                 let mut reply = Vec::new();
                 reply.extend_from_slice(&RPC_RESULT.to_le_bytes());
@@ -1898,6 +2039,7 @@ mod e2e_tests {
             parts: Mutex::new(HashSet::new()),
             flood_replies: AU::new(0),
             gets: AU::new(0),
+            flood_gets: AU::new(0),
             window: Mutex::new(VecDeque::new()),
             penalty: Mutex::new(None),
         });
@@ -1945,6 +2087,7 @@ mod e2e_tests {
         };
         let pc = PacerCfg { rate, burst: 8.0, ceiling, step: 1.0, growth: 1.1, slow_start_cap: rate, hard_floor: 20.0, burst_credit: 0.0, sustain: 0.0 };
         let sh = Arc::new(Shared {
+            shed: Shed::off(),
             gate: None,
             cancel: AtomicBool::new(false),
             err: Mutex::new(None),
@@ -2017,6 +2160,7 @@ mod e2e_tests {
         });
         gate.init(start, unit, size, total);
         let sh = Arc::new(Shared {
+            shed: Shed::off(),
             gate: Some(gate.clone()), cancel: AtomicBool::new(false), err: Mutex::new(None), last_err: Mutex::new(None),
             done_bytes: AtomicU64::new(0), active: AtomicUsize::new(2), next: AtomicUsize::new(0), total,
             retry: Mutex::new(VecDeque::new()), pacer: None, flood_slept: Mutex::new(0.0),
@@ -2069,6 +2213,70 @@ mod e2e_tests {
         assert!(sh.err.lock().unwrap().is_none(), "{:?}", sh.err.lock().unwrap());
         assert_eq!(sh.done_bytes.load(Ordering::SeqCst), size);
         let _ = std::fs::remove_file(path);
+    }
+
+    /// Under a request limit the engine takes connections out of service instead of hammering on, and
+    /// the transfer still arrives complete and correct.
+    #[test]
+    fn download_sheds_connections_under_a_getfile_limit() {
+        let (port, srv, key) = start_server(6, 20);
+        srv.flood_gets.store(1, Ordering::SeqCst);
+        let (size, unit) = (80 * 4096u64, 4096u64);
+        let path = std::env::temp_dir().join(format!("cbcrypto-shed-{}-{}", port, std::process::id()));
+        let f = std::fs::OpenOptions::new().write(true).create(true).open(&path).unwrap();
+        f.set_len(size).unwrap();
+        let conn = ConnCfg {
+            host: "127.0.0.1".into(), port, auth_key: key.to_vec(), auth_key_id: key[..8].to_vec(),
+            salt: 0, init_prefix: Vec::new(), time_offset: 0.0, recv_buf: 0, read_timeout: Duration::from_secs(10),
+        };
+        let cfg = TransferCfg {
+            conn, mode: Mode::Download, inflight: 1, max_reconnects: 5,
+            req_prefix: 0xbe5335beu32.to_le_bytes().to_vec(), file_id: 0, is_big: false, total_parts: 0,
+        };
+        let total = (size / unit) as usize;
+        let sh = Arc::new(Shared {
+            shed: Shed::new(true, 4),
+            gate: None, cancel: AtomicBool::new(false), err: Mutex::new(None), last_err: Mutex::new(None),
+            done_bytes: AtomicU64::new(0), active: AtomicUsize::new(4), next: AtomicUsize::new(0), total,
+            retry: Mutex::new(VecDeque::new()), pacer: None, flood_slept: Mutex::new(0.0),
+            flood_events: Mutex::new(Vec::new()), floods: AtomicU64::new(0), flood_ms: AtomicU64::new(0),
+            flood_max_ms: AtomicU64::new(0), reconnects: AtomicU64::new(0), timeouts: AtomicU64::new(0),
+            server_errs: AtomicUsize::new(0), completed: AtomicUsize::new(0), remaining: total,
+            last_progress: Mutex::new(Instant::now()), stall_limit: Duration::from_secs(60),
+            flood_total_cap: 300.0, flood_each_cap: 30.0, file: f, size, unit, start: 0,
+        });
+        let hs: Vec<_> = (0..4).map(|_| { let (s, c) = (sh.clone(), cfg.clone()); std::thread::spawn(move || worker(s, c)) }).collect();
+        for h in hs { h.join().unwrap(); }
+        assert!(sh.err.lock().unwrap().is_none(), "{:?}", sh.err.lock().unwrap());
+        assert_eq!(sh.done_bytes.load(Ordering::SeqCst), size);
+        let data = std::fs::read(&path).unwrap();
+        assert!(data.iter().enumerate().all(|(i, b)| *b == (i % 251) as u8), "file content is wrong");
+        assert!(sh.shed.events.load(Ordering::SeqCst) >= 1, "a flood must take a connection out of service");
+        assert!(sh.shed.current() >= 2, "never below the minimum");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn shed_steps_down_to_the_minimum_and_regrows_when_quiet() {
+        std::env::set_var("CBCRYPTO_REGROW_SECS", "1");
+        let s = Shed::new(true, 4);
+        std::env::remove_var("CBCRYPTO_REGROW_SECS");
+        assert!(!s.parked(3));
+        s.shed();
+        assert!(s.parked(3) && !s.parked(2));
+        s.shed();
+        s.shed();
+        s.shed();
+        assert_eq!(s.current(), 2, "the minimum holds");
+        assert!(s.parked(2) && !s.parked(1));
+        s.tick();
+        assert_eq!(s.current(), 2, "not before the quiet period is over");
+        std::thread::sleep(Duration::from_millis(1100));
+        s.tick();
+        assert_eq!(s.current(), 3, "one connection comes back");
+        let off = Shed::off();
+        off.shed();
+        assert!(!off.parked(5), "disabled control never parks anyone");
     }
 
     /// A seek: the transfer starts in the middle of the file and its watermark starts there too.
@@ -2182,4 +2390,4 @@ mod e2e_tests {
         assert_eq!(srv.accepted.load(Ordering::SeqCst), after_first, "second transfer must dial nothing new");
         assert_eq!(srv.parts.lock().unwrap().len(), 200);
     }
-    }
+                  }
